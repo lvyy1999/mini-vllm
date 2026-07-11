@@ -29,6 +29,7 @@ class LlamaAttn(nn.Module):
         self.num_kv_heads = self.total_num_kv_heads // self.tp_size
 
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_qo_heads
+        self.scale = self.head_dim ** -0.5
 
         self.qkv_projection = QKVColumnParallelLinear(
             input_size=hidden_size,
@@ -52,6 +53,7 @@ class LlamaAttn(nn.Module):
         self.attention = Attention(
             num_heads=num_qo_heads,
             head_dim=head_dim,
+            scale=self.scale,
             num_kv_heads=num_kv_heads,
             block_size=block_size,
         )
@@ -123,7 +125,7 @@ class LlamaMLP(nn.Module):
             output_sizes=[intermediate_size] * 2,
             bias=bias,
         )
-        self.activation = SiluAndMul()
+        self.activation = SiLUAndMul()
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -147,7 +149,7 @@ class LlamaDecoderLayer(nn.Module):
         num_qo_heads: int = 32,
         num_kv_heads: int = 8,
         has_attn_bias: bool = False,
-        rms_norm_epsilon: float = 1e-05,
+        rms_norm_epsilon: float = 1e-06,
         rope_base: int = 500000,
         max_position_embeddings: int = 131072,
         intermediate_size: int = 8192,
@@ -155,8 +157,7 @@ class LlamaDecoderLayer(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        gamma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma)
+        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
         self.self_attn = LlamaAttn(
             hidden_size=hidden_size,
             head_dim=head_dim,
@@ -168,7 +169,7 @@ class LlamaDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             block_size=block_size,
         )
-        self.post_attention_layernorm = LayerNorm(gamma)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
         self.mlp = LlamaMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -222,7 +223,7 @@ class LlamaModel(nn.Module):
         num_qo_heads: int = 32,
         num_kv_heads: int = 8,
         has_attn_bias: bool = False,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         rope_base: int = 500000,
         max_position_embeddings: int = 131072,
         intermediate_size: int = 8192,
@@ -251,8 +252,7 @@ class LlamaModel(nn.Module):
                 block_size=block_size,
             ) for _ in range(num_layers)
         ])
-        gamma = torch.ones(hidden_size)
-        self.norm = LayerNorm(gamma)
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
@@ -298,8 +298,8 @@ class LlamaForCausalLM(nn.Module):
             block_size=block_size,
         )
         self.lm_head = ParallelLMHead(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_size,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
         )
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

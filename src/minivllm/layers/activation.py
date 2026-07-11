@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 
-class SiluAndMul(nn.Module):
+class SiLUAndMul(nn.Module):
     """
     A custom activation layer that applies the SiLU (Sigmoid Linear Unit) activation
     function followed by element-wise multiplication with the input tensor.
@@ -19,7 +19,7 @@ class SiluAndMul(nn.Module):
 
 if __name__ == "__main__":
     # Example usage
-    layer = SiluAndMul().cuda()
+    layer = SiLUAndMul().cuda()
     input_tensor = torch.randn(8, 4000, 8000).cuda()  # Example input tensor with shape (400, 800)
     
     for _ in range(10):  # Warm-up iterations

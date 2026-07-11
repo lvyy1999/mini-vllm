@@ -40,7 +40,7 @@ class Scheduler:
         if scheduled_sequences:
             return scheduled_sequences, True
         
-        # try schedule for completion from running queue
+        # try schedule for decoding from running queue
         while self.running:
             seq = self.running.popleft()
             # use can_append to check whether we can append one more token

@@ -6,71 +6,56 @@ import torch.nn as nn
 
 @triton.jit
 def store_kvcache_kernel(
-    key_ptr, # pointer to what we want to store
+    key_ptr,
     value_ptr,
-    k_cache_ptr, # pointer to where we want to store
+    k_cache_ptr,
     v_cache_ptr,
     slot_mapping_ptr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    block_size: tl.constexpr
 ):
     """
     Store keys and values into paged KV cache.
     Each token is mapped to a slot via slot_mapping.
     Grid layout: (num_tokens, num_kv_heads)
+    Input layout: (num_tokens, num_kv_heads, head_dim)
     Cache layout: (num_blocks, block_size, num_kv_heads, head_dim)
     """
-    # thread ID, in dimension 0
-    token_idx = tl.program_id(0) # each GPU thread processes one token
-    # slot ID, where in cache to store this token
+    # each thread responsible for one head of one token
+    token_idx = tl.program_id(0) # program_id(0) = which token
+    head_idx = tl.program_id(1) # program_id(1) = which head
+
+    # which slot to store this token
+    # slot_idx = block_idx * block_size + block_offset
     slot_idx = tl.load(slot_mapping_ptr + token_idx)
-    
     if slot_idx == -1:
         return
-    
-    # Calculate which block and position within block
-    block_idx = slot_idx // block_size
-    block_offset = slot_idx % block_size
-    
-    # Process each head
-    # program_id(0) = which token
-    # program_id(1) = which head
-    head_idx = tl.program_id(1)
-    
-    # it creates a vector [0, 1, ..., head_dim-1]
-    # Load key and value for this token and head
+
     head_offsets = tl.arange(0, head_dim)
     # Input: (num_tokens, num_kv_heads, head_dim)
-    # example: input_offset = 5 * (8 * 128) + 3 * 128 + [0, 1, 2, ..., 127]
-    #         = 5120 + 384 + [0, 1, 2, ..., 127]
-    #         = [5504, 5505, 5506, ..., 5631]
-    input_offset = (token_idx * num_kv_heads * head_dim + # skip previous tokens
-                    head_idx * head_dim + # skip previous heads
-                    head_offsets)
-
+    # calculate this head's offsets in input
+    input_offsets = (token_idx * num_kv_heads * head_dim + # skip previous tokens
+                     head_idx * head_dim + # skip previous heads
+                     head_offsets)
     # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
-    cache_offset = (block_idx * block_size * num_kv_heads * head_dim + # skip previous blocks
-                   block_offset * num_kv_heads * head_dim + # skip previous positions in block
-                   head_idx * head_dim + # skip previous heads
-                   head_offsets) 
-    
-    # load key and value value floats from the pointers's memory
-    key = tl.load(key_ptr + input_offset)
-    value = tl.load(value_ptr + input_offset)
-    
+    # and slot_idx = block_idx * block_size + block_offset
+    # calculate this head's offsets in cache
+    cache_offsets = (slot_idx * num_kv_heads * head_dim + # skip previous slots
+                     head_idx * head_dim + # skip previous heads
+                     head_offsets)
+    # load key and value floats from the pointers' memory
+    key = tl.load(key_ptr + input_offsets)
+    value = tl.load(value_ptr + input_offsets)
     # store into cache
-    tl.store(k_cache_ptr + cache_offset, key)
-    tl.store(v_cache_ptr + cache_offset, value)
-
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
 
 def store_kvcache(
     key: torch.Tensor, 
     value: torch.Tensor, 
     k_cache: torch.Tensor, 
     v_cache: torch.Tensor, 
-    slot_mapping: torch.Tensor,
-    block_size: int
+    slot_mapping: torch.Tensor
 ):
     """
     Store key-value pairs into paged cache.
@@ -81,7 +66,6 @@ def store_kvcache(
         k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         slot_mapping: (num_tokens,) - maps each token to a cache slot
-        block_size: number of tokens per block
     """
     num_tokens, num_kv_heads, head_dim = key.shape
     
@@ -93,7 +77,8 @@ def store_kvcache(
     
     assert k_cache.shape == v_cache.shape, "K and V cache shapes must match"
     assert slot_mapping.numel() == num_tokens, "Slot mapping size must match number of tokens"
-    
+
+    # each thread responsible for one head of one token
     grid = (num_tokens, num_kv_heads)
     # launch num_tokens x num_kv_heads threads
     store_kvcache_kernel[grid](
@@ -104,14 +89,16 @@ def store_kvcache(
         slot_mapping,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        block_size=block_size
     )
-
 
 @triton.jit
 def flash_attention_varlen_kernel(
-    Q, K, V, O,
+    q_ptr, # (total_tokens, num_heads, head_dim)
+    k_ptr, # (total_tokens, num_kv_heads, head_dim)
+    v_ptr, # (total_tokens, num_kv_heads, head_dim)
+    o_ptr, # (total_tokens, num_heads, head_dim)
     cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
     scale,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -121,112 +108,108 @@ def flash_attention_varlen_kernel(
 ):
     """
     Flash Attention kernel for variable-length sequences.
-    Each program processes one block of queries for one head in one sequence.
     """
-    # Program IDs
-    start_m = tl.program_id(0) # block index
-    off_h = tl.program_id(1) # head index
-    seq_idx = tl.program_id(2) # sequence index
+    # Each thread responsible for one head of one block of queries of one sequence
+    block_idx = tl.program_id(0) # block index
+    head_idx = tl.program_id(1) # head index of query
+    seq_idx = tl.program_id(2) # sequence index in the continuous batch
 
-    # Determine which KV head to use (for GQA)
-    kv_head_idx = off_h // (num_heads // num_kv_heads)
+    # Determine which KV head to use
+    # For general MHA, num_heads == num_kv_heads -> kv_head_idx == head_idx
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
     
-    # Load sequence boundaries
-    seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
-    seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seq_len = seq_end - seq_start
+    # Load sequence boundaries of queries
+    seq_start_q = tl.load(cu_seqlens_q_ptr + seq_idx)
+    seq_end_q = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    seq_len_q = seq_end_q - seq_start_q
+
+    # Load sequence boundaries of key / value
+    seq_start_kv = tl.load(cu_seqlens_k_ptr + seq_idx)
+    seq_end_kv = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    seq_len_kv = seq_end_kv - seq_start_kv
     
     # Early exit if this block is beyond sequence length
-    if start_m * BLOCK_M >= seq_len:
+    if block_idx * BLOCK_M >= seq_len_q:
         return
     
     # Offset for this block of queries
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, head_dim)
+    head_offsets = tl.arange(0, head_dim)
+    block_offsets_q = block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Query pointers: Q has shape (total_tokens, num_heads, head_dim)
-    q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
-    
-    # Load Q block - shape (BLOCK_M, head_dim)
-    mask_m = offs_m < seq_len
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-    
-    # Initialize output accumulators
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
-    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
-    
-    # Number of blocks to process
-    num_blocks = tl.cdiv(seq_len, BLOCK_N)
-    
-    # Loop over K, V blocks
-    for block_n in range(num_blocks):
-        start_n = block_n * BLOCK_N
-        offs_n = start_n + tl.arange(0, BLOCK_N)
+    # Q: (total_tokens, num_heads, head_dim)
+    # each thread responsible for BLOCK_M * head_dim elements in Q
+    # calculate the offsets of them
+    q_offsets = ((seq_start_q + block_offsets_q[:, None]) * num_heads * head_dim +
+                 head_idx * head_dim +
+                 head_offsets[None, :])
+    # Load Qi block - shape (BLOCK_M, head_dim)
+    q_mask = block_offsets_q < seq_len_q
+    q_i = tl.load(q_ptr + q_offsets, mask=q_mask[:, None], other=0.0)
+
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) # init unscaled sum of row
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10 # init max value of each row as -inf
+    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32) # init unscaled accumulate output
+
+    # Loop process K, V blocks
+    for kv_start in tl.range(0, seq_len_kv, BLOCK_N):
+        # K/V: (total_tokens, num_kv_heads, head_dim)
+        # each loop responsible for BLOCK_N * head_dim elements in K/V
+        # calculate the offsets of them
+        block_offsets_kv = kv_start + tl.arange(0, BLOCK_N)
+        kv_offsets = ((seq_start_kv + block_offsets_kv[:, None]) * num_kv_heads * head_dim +
+                      kv_head_idx * head_dim +
+                      head_offsets[None, :])
+        # Load Kj / Vj block - shape (BLOCK_N, head_dim)
+        kv_mask = block_offsets_kv < seq_len_kv
+        k_j = tl.load(k_ptr + kv_offsets, mask=kv_mask[:, None], other=0.0)
+        v_j = tl.load(v_ptr + kv_offsets, mask=kv_mask[:, None], other=0.0)
         
-        # Mask for valid positions
-        mask_n = offs_n < seq_len
-        
-        # K pointers: K has shape (total_tokens, num_kv_heads, head_dim)
-        k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
-        
-        # Load K block - shape (head_dim, BLOCK_N)
-        k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
-        
-        # Compute QK^T - shape (BLOCK_M, BLOCK_N)
-        qk = tl.dot(q, k)
-        qk = qk * scale
-        
-        # Apply causal mask: only attend to positions <= current position
-        mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
-        qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
+        # Compute QK^T / sqrt(d) - shape (BLOCK_M, BLOCK_N)
+        # s_ij = tl.dot(q_i, k_j, trans_b=True)
+        s_ij = tl.dot(q_i, tl.trans(k_j)) * scale
+        # Apply causal q_mask: only attend to positions <= current position
+        mask_causal = (seq_start_q + block_offsets_q[:, None]) >= (seq_start_kv + block_offsets_kv[None, :])
+        s_ij = tl.where(mask_causal & q_mask[:, None], s_ij, -1e10)
         
         # Online softmax update
-        m_ij = tl.max(qk, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - m_i_new[:, None])
-        
-        # Rescale previous accumulator
-        acc = acc * alpha[:, None]
-        
-        # Load V block - shape (BLOCK_N, head_dim)
-        v_ptrs = V + (seq_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        
-        # Accumulate weighted values
-        acc = acc + tl.dot(p.to(v.dtype), v)
-        
-        # Update normalizer
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_i_new
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p_ij = tl.exp(s_ij - m_new[:, None])
+        l_new = l_i * alpha + tl.sum(p_ij, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p_ij, v_j)
+        m_i = m_new
+        l_i = l_new
     
     # Final normalization
     acc = acc / l_i[:, None]
-    
-    # Store output: O has shape (total_tokens, num_heads, head_dim)
-    o_ptrs = O + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
-    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=mask_m[:, None])
+    # Store into O: (total_tokens, num_heads, head_dim)
+    # each thread responsible for BLOCK_M * head_dim elements in O
+    # the offsets of them in O is the same as A
+    tl.store(o_ptr + q_offsets, acc, mask=q_mask[:, None])
 
 
-def flash_attention_prefill(
+def flash_attention_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     scale: float,
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
     """
-    Optimized Flash Attention for prefill phase with variable-length sequences.
+    Flash Attention for prefill phase with variable-length sequences.
     
     Args:
         q: (total_tokens, num_heads, head_dim)
         k: (total_tokens, num_kv_heads, head_dim)
         v: (total_tokens, num_kv_heads, head_dim)
-        cu_seqlens: cumulative sequence lengths
+        cu_seqlens_q: cumulative sequence lengths of queries
+        cu_seqlens_k: cumulative sequence lengths of key and value
         scale: attention scale factor
     
     Returns:
@@ -236,39 +219,26 @@ def flash_attention_prefill(
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    
-    # Allocate output
+    # Allocate memory for output
     output = torch.empty_like(q)
     
-    # Conservative block sizes to avoid OOM on shared memory
-    # Shared memory usage ~ BLOCK_M * BLOCK_N * 4 bytes (for float32 attention scores)
-    # + BLOCK_M * head_dim * 4 (for Q)
-    # + BLOCK_N * head_dim * 4 (for K, V)
-    # Want to keep total < 48KB for most GPUs
-    
-    if head_dim <= 64:
-        BLOCK_M = 64
-        BLOCK_N = 64
-    elif head_dim <= 128:
-        BLOCK_M = 32
-        BLOCK_N = 32
-    else:
-        BLOCK_M = 16
-        BLOCK_N = 16
-    
-    # Number of sequences
-    num_seqs = cu_seqlens.shape[0] - 1
-    
-    # Find max sequence length to determine grid size
-    cu_seqlens_cpu = cu_seqlens.cpu()
-    max_seq_len = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
-    
-    # Calculate grid dimensions - launch all kernels at once
-    grid = (triton.cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)
-    
+    # Choose block sizes to avoid OOM on shared memory.
+    # Shared memory usage ~
+    #     (2 * BLOCK_M + 2 * BLOCK_N) * head_dim * sizeof(dtype)
+    #     + BLOCK_M * BLOCK_N * sizeof(dtype)
+    #     + 2 * BLOCK_M * sizeof(dtype)
+    BLOCK_M = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
+    BLOCK_N = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
+
+    # Calculate grid dimensions
+    num_seqs = cu_seqlens_q.shape[0] - 1
+    num_blocks = triton.cdiv(max_seqlen_q, BLOCK_M)
+    grid = (num_blocks, num_heads, num_seqs)
+    # launch num_blocks x num_heads × num_seqs threads
     flash_attention_varlen_kernel[grid](
         q, k, v, output,
-        cu_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
         scale,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -281,13 +251,13 @@ def flash_attention_prefill(
 
 
 @triton.jit
-def paged_attention_decode_kernel(
+def flash_attention_with_kvcache_kernel(
+    q_ptr, # (batch_size, num_heads, head_dim)
+    k_cache_ptr, # (max_num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache_ptr, # (max_num_blocks, block_size, num_kv_heads, head_dim)
     output_ptr,
-    query_ptr,
-    k_cache_ptr,
-    v_cache_ptr,
     block_tables_ptr,
-    context_lens_ptr,
+    cache_seqlens_ptr,
     scale: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -297,127 +267,106 @@ def paged_attention_decode_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """
-    Optimized paged attention kernel for decode phase.
-    Processes KV cache in chunks.
+    Flash Attention kernel with kv-cache for decoding.
     """
-    batch_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    
-    # Determine which KV head this query head uses (for GQA)
+    # Each thread responsible for one head of one batch
+    batch_idx = tl.program_id(0) # which batch
+    head_idx = tl.program_id(1) # which head
+    # Determine which KV head this query head uses
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
     
-    # Load context length
-    context_len = tl.load(context_lens_ptr + batch_idx)
+    # Load sequence cache length
+    cache_seq_len = tl.load(cache_seqlens_ptr + batch_idx)
     
-    # Load query: (batch_size, num_heads, head_dim)
-    offs_d = tl.arange(0, head_dim)
-    q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
-    q = tl.load(query_ptr + q_offset)
-    
-    # Initialize accumulators
-    acc = tl.zeros([head_dim], dtype=tl.float32)
-    l_i = 0.0
-    m_i = -1e10
-    
-    # Calculate total number of chunks to process
-    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
-    
-    # Process all tokens in chunks
-    for chunk_idx in range(max_chunks):
-        # Global token index for this chunk
-        token_start = chunk_idx * BLOCK_N
-        
-        # Only process if within valid range
-        if token_start < context_len:
-            # Determine which tokens in this chunk are valid
-            offs_n = token_start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < context_len
-            
-          
-            # Compute attention scores for this chunk
-            qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
-            
-            # Load K for each valid position and compute scores
-            for i in range(BLOCK_N):
-                token_idx = token_start + i
-                if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load K
-                            k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            k_vec = tl.load(k_cache_ptr + k_offset)
-                            
-                            # Compute score for this token
-                            score = tl.sum(q * k_vec) * scale
-                            
-                            # Update qk array at position i using tl.where
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            qk = tl.where(mask_i, score, qk)
-            
-            # Apply mask to invalid positions
-            qk = tl.where(mask_n, qk, -1e10)
-            
-            # Online softmax
-            m_ij = tl.max(qk)
-            m_i_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_i_new)
-            p = tl.exp(qk - m_i_new)
-            
-            # Rescale accumulator
-            acc = acc * alpha
-            l_i = l_i * alpha
-            
-            # Load V and accumulate
-            for i in range(BLOCK_N):
-                token_idx = token_start + i
-                if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load V
-                            v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            v_vec = tl.load(v_cache_ptr + v_offset)
-                            
-                            # Extract weight for this token from p
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            weight = tl.sum(tl.where(mask_i, p, 0.0))
-                            
-                            acc = acc + weight * v_vec
-                            l_i = l_i + weight
-            
-            m_i = m_i_new
-    
-    # Normalize
-    output = acc / l_i
-    
+    # Load query
+    head_offsets = tl.arange(0, head_dim)
+    q_offsets = batch_idx * num_heads * head_dim + head_idx * head_dim + head_offsets
+    q = tl.load(q_ptr + q_offsets)
+
+    l_i = 0.0  # init unscaled sum of row
+    m_i = -1e10  # init max value of row as -inf
+    acc = tl.zeros([head_dim,], dtype=tl.float32) - 1e10  # init unscaled accumulate output
+
+    # Loop process K, V caches
+    # each loop responsible for BLOCK_N K/V caches
+    for kv_start in tl.range(0, cache_seq_len, BLOCK_N):
+        # Calculate the offsets of kv caches in this loop
+        kv_offsets = kv_start + tl.arange(0, BLOCK_N)
+        kv_mask = kv_offsets < cache_seq_len
+
+        # Compute attention scores: qK^T / sqrt(d) - shape (1, BLOCK_N)
+        s = tl.zeros([BLOCK_N], dtype=tl.float32)
+        # Load k for each valid position and compute scores
+        for j in tl.range(BLOCK_N):
+            token_idx = kv_start + j
+            if token_idx < cache_seq_len:
+                block_idx = token_idx // block_size
+                block_offset = token_idx % block_size
+                if block_idx < max_num_blocks:
+                    # Look up physical block
+                    block_table_offset = batch_idx * max_num_blocks + block_idx
+                    physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+                    if physical_block_idx != -1:
+                        # cache: (max_num_blocks, block_size, num_kv_heads, head_dim)
+                        k_offsets = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                     block_offset * num_kv_heads * head_dim +
+                                     kv_head_idx * head_dim +
+                                     head_offsets)
+                        # Load k
+                        k = tl.load(k_cache_ptr + k_offsets)
+                        # Compute score for this token
+                        score = tl.sum(q * k) * scale
+                        # Update s[i] by tl.where
+                        mask_i = tl.arange(0, BLOCK_N) == j
+                        s = tl.where(mask_i, score, s)
+
+        # Apply mask to invalid positions
+        s = tl.where(kv_mask, s, -1e10)
+        # Online softmax
+        m_new = tl.maximum(m_i, tl.max(s))
+        alpha = tl.exp(m_i - m_new)
+        m_i = m_new
+        p = tl.exp(s - m_new)
+        # Rescale accumulator
+        acc = acc * alpha
+        l_i = l_i * alpha
+
+        # Load v and accumulate
+        for j in range(BLOCK_N):
+            token_idx = kv_start + j
+            if token_idx < cache_seq_len:
+                block_idx = token_idx // block_size
+                block_offset = token_idx % block_size
+                if block_idx < max_num_blocks:
+                    # Look up physical block
+                    block_table_offset = batch_idx * max_num_blocks + block_idx
+                    physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+                    if physical_block_idx != -1:
+                        # cache: (max_num_blocks, block_size, num_kv_heads, head_dim)
+                        v_offsets = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                     block_offset * num_kv_heads * head_dim +
+                                     kv_head_idx * head_dim + head_offsets)
+                        # Load v
+                        v = tl.load(v_cache_ptr + v_offsets)
+                        # Extract p[j]
+                        mask_i = tl.arange(0, BLOCK_N) == j
+                        p_j = tl.sum(tl.where(mask_i, p, 0.0))
+                        # Accumulate
+                        l_i = l_i + p_j
+                        acc = acc + p_j * v
+
+    # Final normalization
+    acc = acc / l_i
     # Store output
-    output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
-    tl.store(output_ptr + output_offset, output)
+    tl.store(output_ptr + q_offsets, acc)
 
 
-def paged_attention_decode(
-    query: torch.Tensor,
+def flash_attention_with_kvcache(
+    q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    context_lens: torch.Tensor,
+    cache_seqlens: torch.Tensor,
     scale: float,
     num_heads: int,
     num_kv_heads: int,
@@ -428,36 +377,37 @@ def paged_attention_decode(
     Compute attention in decode mode using paged KV cache.
     
     Args:
-        query: (batch_size, num_heads, head_dim)
+        q: (batch_size, num_heads, head_dim)
         k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         block_tables: (batch_size, max_num_blocks)
-        context_lens: (batch_size,)
+        cache_seqlens: (batch_size,)
         scale: attention scale factor
     
     Returns:
         output: (batch_size, num_heads, head_dim)
     """
-    batch_size = query.shape[0]
+    batch_size = q.shape[0]
     max_num_blocks = block_tables.shape[1]
     
-    # Make contiguous
-    query = query.contiguous()
+    # Make q contiguous
+    q = q.contiguous()
+    # Allocate memory for output
+    output = torch.empty_like(q)
     
-    output = torch.empty_like(query)
-    
-    # Chunk size for processing KV tokens
+    # Choose chunk size for processing K/V caches
     BLOCK_N = 64 if head_dim <= 128 else 32
-    
+
+    # each thread responsible for one head of one batch
     grid = (batch_size, num_heads)
-    
-    paged_attention_decode_kernel[grid](
-        output,
-        query,
+    # launch batch_size x num_heads threads
+    flash_attention_with_kvcache_kernel[grid](
+        q,
         k_cache,
         v_cache,
+        output,
         block_tables,
-        context_lens,
+        cache_seqlens,
         scale=scale,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -476,7 +426,7 @@ class Attention(nn.Module):
         num_heads: int,
         head_dim: int,
         scale: float = 1.0,
-        num_kv_heads: int = None,
+        num_kv_heads: int | None = None,
         block_size: int = 16,
     ):
         super().__init__()
@@ -490,43 +440,32 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-
         # Store current k, v into cache if cache is allocated
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
-            # Ensure k, v are in the right shape: (num_tokens, num_kv_heads, head_dim)
-            if k.dim() == 4:
-                # Batched: (B, N, num_kv_heads, head_dim) -> reshape to (B*N, num_kv_heads, head_dim)
-                B, N, num_kv_heads, head_dim = k.shape
-                k_to_store = k.reshape(B * N, num_kv_heads, head_dim).contiguous()
-                v_to_store = v.reshape(B * N, num_kv_heads, head_dim).contiguous()
-            else:
-                # Already in correct shape (num_tokens, num_kv_heads, head_dim)
-                k_to_store = k.contiguous()
-                v_to_store = v.contiguous()
-            
-            store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
-        scale = self.scale / (self.head_dim ** 0.5)
-
-        if context.is_prefill:
-            # Prefill: use flash attention
-            # Varlen mode: (total_tokens, num_heads, head_dim)
-            cu_seqlens = context.cu_seqlens_q
-            if cu_seqlens is None:
-                raise ValueError("cu_seqlens_q must be provided for varlen attention")
-            
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
+        if context.is_prefill: # Prefill: use flash attention varlen mode
+            o = flash_attention_varlen(
+                q, k, v,
+                context.cu_seqlens_q,
+                context.cu_seqlens_k,
+                context.max_seqlen_q,
+                context.max_seqlen_k,
+                self.scale,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim
+            )
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
-        else:
-            o = paged_attention_decode(
+        else: # Decode
+            o = flash_attention_with_kvcache(
                 q, 
                 k_cache, 
                 v_cache,
                 context.block_tables,
                 context.context_lens,
-                scale,
+                self.scale,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -535,29 +474,3 @@ class Attention(nn.Module):
             # o: (batch_size, num_heads, head_dim) -> (batch_size, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
 
-
-if __name__ == "__main__":
-    # Example usage
-    layer = Attention(num_heads=8, head_dim=64).cuda()
-    B, N, D = 4, 1024, 512
-    q = torch.randn(B, N, D).cuda()
-    k = torch.randn(B, N, D).cuda()
-    v = torch.randn(B, N, D).cuda()
-    layer.k_cache = torch.zeros(B, N, D).cuda()
-    layer.v_cache = torch.zeros(B, N, D).cuda()
-    slot_mapping = torch.arange(N).cuda()
-
-    for _ in range(10):  # Warm-up iterations
-        _ = layer(q, k, v)
-
-    import time
-    times = []
-    for _ in range(100):  # Timing iterations
-        torch.cuda.synchronize()
-        start_time = time.time()
-        output_tensor = layer(q, k, v)
-        torch.cuda.synchronize()
-        end_time = time.time()
-        times.append(end_time - start_time)
-    avg_time = sum(times) / len(times)
-    print(f"Average inference time over 100 runs: {avg_time * 1000:.4f} ms")

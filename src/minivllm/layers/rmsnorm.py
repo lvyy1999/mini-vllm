@@ -1,33 +1,41 @@
 import torch
-import time 
+import time
 
-class LayerNorm(torch.nn.Module):
-    def __init__(self, gamma: torch.Tensor, eps: float = 1e-5):
+class RMSNorm(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6
+    ):
         super().__init__()
-        # Use nn.Parameter to make gamma learnable and loadable from checkpoints
-        self.weight = torch.nn.Parameter(gamma.detach().clone())
+        # Use nn.Parameter to make weight(gamma) learnable and loadable from checkpoints
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
-    @property
-    def gamma(self):
-        """Backward compatibility: gamma alias for weight"""
-        return self.weight
-
     @torch.compile
-    def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def rms_forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
         # RMSNorm(x) = (x / sqrt(mean(x²) + ε)) ⊙ γ
-
-        variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        sqrt_variance = variance.sqrt()
-        x_norm = (x / sqrt_variance * self.weight)
-
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x_norm = x / rms * self.weight
         return x_norm
 
-    def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    @torch.compile
+    def residual_rms_forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x = x + residual
         return self.rms_forward(x), x
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
         if residual is not None:
             return self.residual_rms_forward(x, residual)
         else:
@@ -36,8 +44,7 @@ class LayerNorm(torch.nn.Module):
 if __name__ == "__main__":
     # Example usage
     x = torch.randn(8,4000,8000).cuda()
-    gamma = torch.full((8000,), 0.5, device="cuda", dtype=x.dtype)
-    layer = LayerNorm(gamma=gamma).cuda()
+    layer = RMSNorm(8000).cuda()
     residual = torch.full_like(x,fill_value=1)
 
     for _ in range(10): # Warm-up iterations

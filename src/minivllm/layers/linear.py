@@ -1,5 +1,6 @@
-import torch.nn as nn 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 
 class LinearBase(nn.Module):
@@ -20,22 +21,22 @@ class LinearBase(nn.Module):
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         
-        # create weight parameter with custom weight loader
+        # create weight parameter with weight loader
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
 
         # create bias parameter
         if bias:
-            self.bias = nn.Parameter(torch.zeros(output_size))
+            self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader 
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
-        raise NotImplementedError("Subclasses should implement this method.")
+        raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("Subclasses should implement this method.")
+        raise NotImplementedError
 
 """
 these functions are for is that we deploy a maybe randomly initialized model on GPU using some tensor/pipeline parallel method
@@ -57,7 +58,7 @@ for name, param in model.named_parameters():
             param.data.copy_(loaded_weight)
 """
 
-# the simpliest Linear layer: ReplicatedLinear(LinearBase)
+# the simplest Linear layer: ReplicatedLinear(LinearBase)
 # where we simply copy the weight as the weight_loader
 # and run the forward as a normal linear layer
 class ReplicatedLinear(LinearBase):
@@ -73,9 +74,9 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return nn.functional.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)
 
-# columnsplit Linear layer: ColumnParallelLinear(LinearBase)
+# column-split Linear layer: ColumnParallelLinear(LinearBase)
 # get the original full parameter
 # compute the starting index of the column split
 # compute the dim size of the full parameter
@@ -96,17 +97,17 @@ class ColumnParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param_data = param.data 
         # full_dim on the output column
-        full_data_output_size = loaded_weights.size(0)
+        full_output_size = loaded_weights.size(0)
         # dim size after sharding
-        shard_size = full_data_output_size // self.tp_size
+        shard_size = full_output_size // self.tp_size
         assert shard_size == param_data.size(0), "Shard size does not match parameter size."
-        # starting index
+        # split the original full weights and copy
         start_index = self.tp_rank * shard_size
-        slided_weight = loaded_weights.narrow(0, start_index, shard_size)
-        param_data.copy_(slided_weight)
+        shard_weights = loaded_weights.narrow(0, start_index, shard_size)
+        param_data.copy_(shard_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return nn.functional.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)
 
 # an extension of ColumnParallelLinear by merging several matrices
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -119,62 +120,48 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
 
+    # split each weight matrix into tp_size gpus
     # param: parameter to be reloaded after tensor parallelism
     # loaded_weights: the original full parameter to be loaded into param
-    # the index of merged matrices (e.g. it's 0 for Q, 1 for K, 2 for V assuming QKV are merged together)
+    # loaded_weight_id: the index of merged matrices (e.g. it's 0 for Q, 1 for K, 2 for V assuming QKV are merged together)
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor, loaded_weight_id: int):
-        """
-        checkpoint = {
-            'q_proj.weight': torch.randn(4096, 4096),  
-            'k_proj.weight': torch.randn(4096, 4096),
-            'v_proj.weight': torch.randn(4096, 4096),
-        }
-        load to 
-        merged_layer = Linear(
-            input_size=4096,
-            output_sizes=sum([4096, 4096, 4096]),  # Q, K, V
-        ) which is also sharded by tp_size
-        """
         param_data = param.data
-        # compute offset 
+        # compute offset of param_data
         offset = sum(self.output_sizes[:loaded_weight_id]) // self.tp_size
-        # compute size
+        # compute shard_size of loaded_weight_id^th matrix
         shard_size = self.output_sizes[loaded_weight_id] // self.tp_size
         # find the correct slice to be loaded in the sharded parameter
         param_data = param_data.narrow(0, offset, shard_size)
-        # shard the original full weight
-        loaded_weights_start_index = self.tp_rank * shard_size
-        shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)
+        # split the original full weights and copy
+        start_index = self.tp_rank * shard_size
+        shard_weights = loaded_weights.narrow(0, start_index, shard_size)
         param_data.copy_(shard_weights)
 
 
 class QKVColumnParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
-        input_size: int,
+        hidden_size: int,
         head_size: int,
         num_heads: int,
         num_kv_heads: int | None = None,
         bias: bool = False,
     ):
-        self.tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size()
         num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
-        self.num_heads = num_heads // self.tp_size
-        self.num_kv_heads = num_kv_heads // self.tp_size
-        # Calculate per-GPU output size
-        self.output_size = head_size * (self.num_heads + 2 * self.num_kv_heads)
-        # Pass TOTAL output size to parent (it will divide by tp_size)
-        total_output_size = head_size * (num_heads + 2 * num_kv_heads)
-        super().__init__(input_size, total_output_size, bias=bias)
+        assert num_heads % tp_size == 0, "num_heads must be divisible by tensor parallel size."
+        self.num_heads = num_heads // tp_size
+        assert num_kv_heads % tp_size == 0, "num_kv_heads must be divisible by tensor parallel size."
+        self.num_kv_heads = num_kv_heads // tp_size
+        output_size = head_size * (num_heads + 2 * num_kv_heads)
+        super().__init__(hidden_size, output_size, bias=bias)
 
     # load_weight_id: q, k, v
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor, load_weight_id: str):
-        # batch_size * num_heads * num_token * head_size
         param_data = param.data
-        # loaded_weights: batch_size * num_token * (head_size*num_heads)
         assert load_weight_id in ['q', 'k', 'v'], "load_weight_id must be one of 'q', 'k', 'v'"
-        # compute offset
+        # calculate offset and shard_size
         if load_weight_id == 'q':
             offset = 0
             shard_size = self.head_size * self.num_heads
@@ -184,16 +171,12 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         elif load_weight_id == 'v':
             offset = self.head_size * self.num_heads + self.head_size * self.num_kv_heads
             shard_size = self.head_size * self.num_kv_heads
-        else:
-            raise ValueError(f"Unknown load_weight_id: {load_weight_id}")
-
+        # find the correct slice to be loaded in the sharded parameter
         param_data = param_data.narrow(0, offset, shard_size)
-        # shard the original full weight
-        loaded_weights_start_index = self.tp_rank * shard_size
-        shard_weights = loaded_weights.narrow(0, loaded_weights_start_index, shard_size)
-
+        # split the original full weights and copy
+        start_index = self.tp_rank * shard_size
+        shard_weights = loaded_weights.narrow(0, start_index, shard_size)
         param_data.copy_(shard_weights)
-
 
 class RowParallelLinear(LinearBase):
     def __init__(
@@ -209,20 +192,20 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
         param_data = param.data 
         # full_dim on the input row
-        full_data_input_size = loaded_weights.size(1)
+        full_input_size = loaded_weights.size(1)
         # dim size after sharding
-        shard_size = full_data_input_size // self.tp_size
+        shard_size = full_input_size // self.tp_size
         assert shard_size == param_data.size(1), "Shard size does not match parameter size."
-        # starting index
+        # split the original full weights and copy
         start_index = self.tp_rank * shard_size
-        slided_weight = loaded_weights.narrow(1, start_index, shard_size)
-        param_data.copy_(slided_weight)
+        shard_weights = loaded_weights.narrow(1, start_index, shard_size)
+        param_data.copy_(shard_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = nn.functional.linear(x, self.weight, self.bias)
+        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(result, op=dist.ReduceOp.SUM)
-        return result
+            dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        return y
 
 
 if __name__ == "__main__":

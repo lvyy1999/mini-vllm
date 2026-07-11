@@ -14,9 +14,8 @@ class Qwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         head_dim: int,
-        scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -33,10 +32,10 @@ class Qwen3Attention(nn.Module):
         self.num_kv_heads = self.total_num_kv_heads // self.tp_size
 
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_heads
-        self.scale = scale
+        self.scale = self.head_dim ** -0.5
 
         self.qkv_projection = QKVColumnParallelLinear(
-            input_size=hidden_size,  # Fixed: was head_dim * total_num_heads, should be hidden_size
+            hidden_size=hidden_size,  # Fixed: was head_dim * total_num_heads, should be hidden_size
             head_size=head_dim,
             num_heads=self.total_num_heads,
             num_kv_heads=self.total_num_kv_heads,
@@ -47,8 +46,8 @@ class Qwen3Attention(nn.Module):
         self.qkv_bias = qkv_bias
 
         # Q and K norms as used in Qwen3
-        self.q_norm = LayerNorm(torch.ones(head_dim))
-        self.k_norm = LayerNorm(torch.ones(head_dim))
+        self.q_norm = RMSNorm(head_dim, eps=rms_norm_epsilon)
+        self.k_norm = RMSNorm(head_dim, eps=rms_norm_epsilon)
 
         self.rotary_emb = RotaryEmbedding(
             base=base,
@@ -59,7 +58,7 @@ class Qwen3Attention(nn.Module):
         self.attention = Attention(
             self.num_heads,
             head_dim,
-            scale,
+            self.scale,
             self.num_kv_heads,
             block_size
         )
@@ -106,7 +105,7 @@ class Qwen3Attention(nn.Module):
         # Apply Q and K norms - these are used in Qwen3 to stabilize attention
         # Applied to q and k because they participate in attention_weight computation
         # Removes possibility of large numbers that cause softmax instability
-        if self.qkv_bias is False:
+        if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
 
@@ -142,7 +141,7 @@ class Qwen3MLP(nn.Module):
             output_sizes=[intermediate_size] * 2,
             bias=bias,
         )
-        self.activation = SiluAndMul()
+        self.activation = SiLUAndMul()
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
@@ -165,9 +164,8 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_size: int,
         num_heads: int,
         head_dim: int,
-        scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -176,13 +174,11 @@ class Qwen3DecoderLayer(nn.Module):
         block_size: int = 256,
     ):
         super().__init__()
-        gamma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma)
+        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
-            scale=scale,
             num_kv_heads=num_kv_heads,
             rms_norm_epsilon=rms_norm_epsilon,
             qkv_bias=qkv_bias,
@@ -190,7 +186,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=max_position,
             block_size=block_size,
         )
-        self.post_attention_layernorm = LayerNorm(gamma)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -240,7 +236,7 @@ class Qwen3Model(nn.Module):
         head_dim: int,
         scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -251,15 +247,14 @@ class Qwen3Model(nn.Module):
     ):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=vocab_size,
-            embedding_dim = hidden_size
+            vocab_size=vocab_size,
+            hidden_size = hidden_size
         )
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 hidden_size=hidden_size,
                 num_heads=num_heads,
                 head_dim=head_dim,
-                scale=scale,
                 num_kv_heads=num_kv_heads,
                 rms_norm_epsilon=rms_norm_epsilon,
                 qkv_bias=qkv_bias,
@@ -270,8 +265,7 @@ class Qwen3Model(nn.Module):
                 block_size=block_size,
             ) for _ in range(num_layers)
         ])
-        gamma = torch.ones(hidden_size)
-        self.norm = LayerNorm(gamma)
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
@@ -330,8 +324,8 @@ class Qwen3ForCausalLM(nn.Module):
             block_size=block_size,
         )
         self.lm_head = ParallelLMHead(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_size
+            vocab_size=vocab_size,
+            hidden_size=hidden_size
         )
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
