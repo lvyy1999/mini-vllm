@@ -258,8 +258,8 @@ class Qwen3ForCausalLM(nn.Module):
         "q_proj": ('qkv_proj', 'q'),
         "k_proj": ('qkv_proj', 'k'),
         "v_proj": ('qkv_proj', 'v'),
-        "gate_proj": ('gate_up_proj', '0'),
-        "up_down": ('gate_up_proj', '1'),
+        "gate_proj": ('gate_up_proj', 0),
+        "up_proj": ('gate_up_proj', 1),
     }
     def __init__(
         self,

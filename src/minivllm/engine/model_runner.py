@@ -1,10 +1,14 @@
 import math
+from typing import Any
+
 import torch
 import pickle
 import torch.distributed as dist
 from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+
+from torch import Tensor
 
 from minivllm.models.qwen3 import Qwen3ForCausalLM
 from minivllm.models.llama import LlamaForCausalLM
@@ -36,14 +40,12 @@ class ModelRunner:
                     hidden_size=config['hidden_size'],
                     num_heads=config['num_heads'],
                     head_dim=config['head_dim'],
-                    scale=config['scale'],
                     num_kv_heads=config['num_kv_heads'],
                     rms_norm_epsilon=config['rms_norm_epsilon'],
                     qkv_bias=config['qkv_bias'],
                     base=config['base'],
                     max_position=config['max_position'],
                     intermediate_size=config['intermediate_size'],
-                    ffn_bias=config['ffn_bias'],
                     num_layers=config['num_layers'],
                     tie_word_embeddings=config['tie_word_embeddings'],
                     block_size=self.block_size,
@@ -262,10 +264,10 @@ class ModelRunner:
     #               │  │  └──── end of seq2 (position 5)
     #               │  └─────── end of seq1 (position 3)
     #               └────────── start (position 0)
-    def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
+    def prepare_prefill(self, seqs: list[Sequence]) -> tuple[Tensor, Tensor]:
         # length: sum of all input_ids after prefix cache
         input_ids = []
-        # length: sum of all input_ids after prefix cache
+        positions = []
         slot_mappings = []
         # length: num_seqs
         seqlens_q = []
@@ -281,6 +283,7 @@ class ModelRunner:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
             input_ids.extend(token_ids[num_cached_tokens:])
+            positions.extend(range(num_cached_tokens, num_cached_tokens + len(token_ids[num_cached_tokens:])))
             seqlens_q.append(len(token_ids) - num_cached_tokens)
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
@@ -299,6 +302,7 @@ class ModelRunner:
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
         set_context(
@@ -311,17 +315,19 @@ class ModelRunner:
             context_lens=None,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
         )
-        return input_ids
+        return input_ids, positions
 
 
     # prepare input data for decoding
-    def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
+    def prepare_decode(self, seqs: list[Sequence]) -> tuple[Tensor, Tensor]:
         input_ids = []
+        positions = []
         context_lens = []   
         slot_mappings = []  
         block_tables = []
         for seq in seqs:
             input_ids.append(seq.last_token)
+            positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mappings.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         all_block_tables = [seq.block_table for seq in seqs]
@@ -330,6 +336,7 @@ class ModelRunner:
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
@@ -340,7 +347,7 @@ class ModelRunner:
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
         )
-        return input_ids    
+        return input_ids, positions
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
@@ -351,11 +358,11 @@ class ModelRunner:
     # allocate input_ids, positions, slot_mapping, context_lens, block_tables, outputs
     # into graph_variable, and then replay the graph
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         if is_prefill or self.enforce_eager:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
-            hidden_states = self.model(input_ids)
+            hidden_states = self.model(input_ids, positions)
             logits = self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
@@ -385,10 +392,10 @@ class ModelRunner:
     # reset context
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if is_prefill:
-            input_ids = self.prepare_prefill(seqs)
+            input_ids, positions = self.prepare_prefill(seqs)
         else:
-            input_ids = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, is_prefill)
+            input_ids, positions = self.prepare_decode(seqs)
+        logits = self.run_model(input_ids, positions, is_prefill)
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
