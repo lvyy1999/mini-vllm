@@ -123,7 +123,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     # split each weight matrix into tp_size gpus
     # param: parameter to be reloaded after tensor parallelism
     # loaded_weights: the original full parameter to be loaded into param
-    # loaded_weight_id: the index of merged matrices (e.g. it's 0 for Q, 1 for K, 2 for V assuming QKV are merged together)
+    # loaded_weight_id: the index of merged matrices (e.g. it's 0 for gate_proj, 1 for up_proj assuming gate_proj and up_proj are merged together)
     def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor, loaded_weight_id: int):
         param_data = param.data
         # compute offset of param_data
@@ -142,19 +142,19 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
         hidden_size: int,
-        head_size: int,
+        head_dim: int,
         num_heads: int,
         num_kv_heads: int | None = None,
         bias: bool = False,
     ):
         tp_size = dist.get_world_size()
         num_kv_heads = num_kv_heads or num_heads
-        self.head_size = head_size
+        self.head_dim = head_dim
         assert num_heads % tp_size == 0, "num_heads must be divisible by tensor parallel size."
         self.num_heads = num_heads // tp_size
         assert num_kv_heads % tp_size == 0, "num_kv_heads must be divisible by tensor parallel size."
         self.num_kv_heads = num_kv_heads // tp_size
-        output_size = head_size * (num_heads + 2 * num_kv_heads)
+        output_size = head_dim * (num_heads + 2 * num_kv_heads)
         super().__init__(hidden_size, output_size, bias=bias)
 
     # load_weight_id: q, k, v
@@ -164,13 +164,13 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         # calculate offset and shard_size
         if load_weight_id == 'q':
             offset = 0
-            shard_size = self.head_size * self.num_heads
+            shard_size = self.head_dim * self.num_heads
         elif load_weight_id == 'k':
-            offset = self.head_size * self.num_heads
-            shard_size = self.head_size * self.num_kv_heads
+            offset = self.head_dim * self.num_heads
+            shard_size = self.head_dim * self.num_kv_heads
         elif load_weight_id == 'v':
-            offset = self.head_size * self.num_heads + self.head_size * self.num_kv_heads
-            shard_size = self.head_size * self.num_kv_heads
+            offset = self.head_dim * self.num_heads + self.head_dim * self.num_kv_heads
+            shard_size = self.head_dim * self.num_kv_heads
         # find the correct slice to be loaded in the sharded parameter
         param_data = param_data.narrow(0, offset, shard_size)
         # split the original full weights and copy
@@ -207,15 +207,3 @@ class RowParallelLinear(LinearBase):
             dist.all_reduce(y, op=dist.ReduceOp.SUM)
         return y
 
-
-if __name__ == "__main__":
-    # Example usage
-    if dist.is_available() and not dist.is_initialized():
-        dist.init_process_group(
-            backend="gloo",
-            init_method="tcp://127.0.0.1:29500",
-            rank=0,
-            world_size=1,
-        )
-    layer = LinearBase(input_size=10, output_size=5)
-    print("LinearBase layer initialized:", layer)

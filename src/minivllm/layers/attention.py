@@ -583,14 +583,12 @@ class Attention(nn.Module):
                                         cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
                                         max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
                                         block_size=self.block_size, block_tables=context.block_tables)
-            # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
-            return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+            return o
         else: # Decode
             o = flash_attention_decode(q, k_cache, v_cache,
                                        scale=self.scale, head_dim=self.head_dim,
                                        num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
                                        block_size=self.block_size, block_tables=context.block_tables,
                                        cache_seqlens=context.context_lens)
-            # o: (batch_size, num_heads, head_dim) -> (batch_size, num_heads * head_dim)
-            return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+            return o
 
