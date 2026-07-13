@@ -1,6 +1,5 @@
 from enum import Enum, auto
-import math
-from itertools import count 
+from itertools import count
 from minivllm.sampling_parameters import SamplingParams
 from copy import copy
 
@@ -13,9 +12,12 @@ class SequenceStatus(Enum):
 
 class Sequence:
     counter = count()
-
-    def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
-        self.block_size = block_size # number of tokens per block
+    block_size = 256
+    def __init__(
+            self,
+            token_ids: list[int],
+            sampling_params = SamplingParams()
+    ):
         # record sequence id
         self.seq_id = next(Sequence.counter)
         # status
@@ -24,18 +26,22 @@ class Sequence:
         self.token_ids = copy(token_ids)
         # last token
         self.last_token = self.token_ids[-1] if self.token_ids else None
-        # num_tokens, num_prompt_tokens
+        # num of all tokens
         self.num_tokens = len(self.token_ids)
+        # num of prompt tokens
         self.num_prompt_tokens = len(self.token_ids)
-        # num_cached_tokens = 0
+        # num of tokens in cache
         self.num_cached_tokens = 0
-        # block_table
+        # num of tokens scheduled in this turn
+        self.num_scheduled_tokens = 0
+        # prefill or decode
+        self.is_prefill = True
+        # block table
         self.block_table = []
-        # sampling_params' related things
+        # sampling_params
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        self.max_model_length = sampling_params.max_model_length
 
     def __len__(self):
         return self.num_tokens
@@ -60,21 +66,16 @@ class Sequence:
         return self.token_ids[self.num_prompt_tokens:]
 
     @property
-    def num_cached_blocks(self):
-        return int(math.ceil(self.num_cached_tokens / self.block_size))
-
-    @property
     def num_blocks(self):
-        return int(math.ceil(self.num_tokens / self.block_size))
+        return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
     def last_block_num_tokens(self):
-        full_blocks = int(math.floor(self.num_tokens / self.block_size))
-        return len(self.token_ids[full_blocks * self.block_size : ])
+        return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
         assert 0 <= i < self.num_blocks, f"Block index {i} out of range [0, {self.num_blocks})"
-        if i == self.num_blocks - 1:
+        if i == self.num_blocks - 1: # the last block maybe not full
             return self.token_ids[-self.last_block_num_tokens:]
         else:
             start_idx = i * self.block_size
@@ -90,9 +91,11 @@ class Sequence:
         return (
             self.num_tokens, 
             self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.block_size,
+            self.token_ids if self.is_prefill else self.last_token
         )
 
     def __setstate__(self, state):
@@ -100,12 +103,12 @@ class Sequence:
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_scheduled_tokens,
             self.block_table,
+            self.block_size,
             last_token_or_ids
         ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
-        num_completion_tokens = self.num_tokens - self.num_prompt_tokens
-        if num_completion_tokens == 0:
+        if isinstance(last_token_or_ids, list):
             # Prefill: last_token_or_ids is the full token_ids list
             self.token_ids = last_token_or_ids
         else:

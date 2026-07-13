@@ -1,60 +1,48 @@
-import sys, os
+import os
+import sys
 from pathlib import Path
-import torch.distributed as dist
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+
+from minivllm import LLM, SamplingParams
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from minivllm.models.qwen3 import Qwen3ForCausalLM
-from minivllm.engine.llm_engine import LLMEngine as LLM
-from minivllm.sampling_parameters import SamplingParams
-
-config = {
-    'max_num_sequences': 16,
-    'max_num_batched_tokens': 1024,
-    'max_cached_blocks': 1024,
-    'block_size': 256,
-    'world_size': 1,
-    'model_name_or_path': 'Qwen/Qwen3-0.6B',
-    'enforce_eager': True,
-    'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
-    'hidden_size': 1024,
-    'num_heads': 16,
-    'head_dim': 128,  # Fixed: was 64, should be 128 (hidden_size / num_heads for GQA output)
-    'num_kv_heads': 8,
-    'intermediate_size': 3072,
-    'num_layers': 28,
-    'tie_word_embeddings': True,
-    'base': 1000000,  # Fixed: was 10000, HF uses rope_theta=1000000
-    'rms_norm_epsilon': 1e-6,
-    'qkv_bias': False,
-    'scale': 1,
-    'max_position': 32768, # should be >= max_model_length, max position index allowed in rotary embedding
-    'ffn_bias': False,  # Fixed: HF Qwen3 doesn't use MLP bias
-    'max_num_batch_tokens': 4096,
-    'max_model_length': 128,
-    'gpu_memory_utilization': 0.9,
-    'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
+# config of used custom model
+model_config = {
+  "architectures": [
+    "Qwen3ForCausalLM"
+  ],
+  "attention_bias": False,
+  "bos_token_id": 151643,
+  "eos_token_id": 151645,
+  "head_dim": 128,
+  "hidden_size": 1024,
+  "intermediate_size": 3072,
+  "max_position_embeddings": 40960,
+  "model_type": "qwen3",
+  "num_attention_heads": 16,
+  "num_hidden_layers": 28,
+  "num_key_value_heads": 8,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000,
+  "tie_word_embeddings": True,
+  "torch_dtype": "bfloat16",
+  "vocab_size": 151936
 }
 
 def main():
+    model = "Qwen/Qwen3-0.6B"
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    model_name = config.get('model_name_or_path', 'Qwen/Qwen3-0.6B')
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)
-    llm = LLM(config=config)
-    
-    # max_tokens is the max number of generated tokens
-    # max_model_length is the max total length including prompt
-    # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
+    tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=path)
+    llm = LLM(enforce_eager=True, model_name_or_path=model, custom_model_config=model_config)
+
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
         "introduce yourself",# * 15,
         "list all prime numbers within 100",# * 15,
         "give me your opinion on the impact of artificial intelligence on society",# * 15,
-    ] #* 30
+    ] # * 30
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -63,15 +51,12 @@ def main():
         )
         for prompt in prompts
     ]
+
     outputs = llm.generate(prompts, sampling_params)
-
-    # outputs is a dict with 'text' and 'token_ids' keys
-    generated_texts = outputs['text']
-
-    for prompt, output in zip(prompts, generated_texts):
+    for prompt, output in zip(prompts, outputs):
         print("\n")
         print(f"Prompt: {prompt}")
-        print(f"Completion: {output}")
+        print(f"Completion: {output['text']}")
 
 
 if __name__ == "__main__":

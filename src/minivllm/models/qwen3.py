@@ -251,8 +251,6 @@ class Qwen3Model(nn.Module):
         x, _ = self.norm(x, residual)
         return x
 
-# Qwen3ForCausalLM
-# add lm_head on top of Qwen3Model
 class Qwen3ForCausalLM(nn.Module):
     packed_module_mapping = {
         "q_proj": ('qkv_proj', 'q'),
@@ -261,42 +259,36 @@ class Qwen3ForCausalLM(nn.Module):
         "gate_proj": ('gate_up_proj', 0),
         "up_proj": ('gate_up_proj', 1),
     }
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int | None = None,
-        num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-6,
-        qkv_bias: bool = False,
-        base: int = 10000,
-        max_position: int = 16384,
-        intermediate_size: int = 4 * 1024,
-        num_layers: int = 12,
-        tie_word_embeddings: bool = False,
-        block_size: int = 256,
-    ):
+    def __init__(self, config: dict, block_size: int = 256):
+        """
+        Args:
+            config (dict): config of Qwen3
+            block_size (int): size of kv cache block, used for flash paged attention
+        """
         super().__init__()
-        head_dim = head_dim if head_dim is not None else hidden_size // num_heads
+        vocab_size = config.get("vocab_size", 151936)
+        hidden_size = config.get("hidden_size", 1024)
+        num_heads = config.get("num_attention_heads", 16)
+        head_dim = config["head_dim"] if "head_dim" in config else hidden_size // num_heads
         self.model = Qwen3Model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
-            rms_norm_epsilon=rms_norm_epsilon,
-            qkv_bias=qkv_bias,
-            base=base,
-            max_position=max_position,
-            intermediate_size=intermediate_size,
-            num_layers=num_layers,
+            num_kv_heads=config.get("num_key_value_heads", 8),
+            rms_norm_epsilon=config.get("rms_norm_eps", 1e-6),
+            qkv_bias=config.get("attention_bias", False),
+            base=config.get("rope_theta", 1000000),
+            max_position=config.get("max_position_embeddings", 40960),
+            intermediate_size=config.get("intermediate_size", 3072),
+            num_layers=config.get("num_hidden_layers", 28),
             block_size=block_size,
         )
         self.lm_head = ParallelLMHead(
             vocab_size=vocab_size,
             hidden_size=hidden_size
         )
+        tie_word_embeddings = config.get("tie_word_embeddings", True)
         if tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 

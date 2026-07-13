@@ -29,7 +29,7 @@ def store_kvcache_kernel(
     # slot_idx = block_idx * block_size + block_offset
     slot_idx = tl.load(slot_mapping_ptr + token_idx)
     if slot_idx == -1:
-        return
+        return # when run cuda graph, maybe padding with -1
 
     head_offsets = tl.arange(0, head_dim)
     # Input: (num_tokens, num_kv_heads, head_dim)
@@ -135,7 +135,7 @@ def flash_attention_prefill_with_cache_kernel(
     if group_idx * BLOCK_M >= batch_len_q:
         return
 
-    # Calculate the actual start position of queries in itself's sequence
+    # Calculate the actual start position of queries in itself's sequence,
     # use for calculate causal mask
     actual_start_q = full_seq_len - batch_len_q
 
@@ -161,15 +161,18 @@ def flash_attention_prefill_with_cache_kernel(
         # each loop responsible for BLOCK_N * head_dim elements in K/V
         # calculate the offsets of them
         kv_offset = kv_start + tl.arange(0, BLOCK_N) # (BLOCK_N, )
+        kv_mask = kv_offset < full_seq_len  # (BLOCK_N, )
         block_idx = kv_offset // block_size # (BLOCK_N, )
         block_offset = kv_offset % block_size # (BLOCK_N, )
-        physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + block_idx) # (BLOCK_N, )
+        physical_block_idx = tl.load(
+            block_tables_ptr + batch_idx * max_num_blocks + block_idx,
+            mask=kv_mask, other=-1
+        ) # (BLOCK_N, )
         kv_cache_offset = (physical_block_idx[:, None] * block_size * num_kv_heads * head_dim +
                            block_offset[:, None] * num_kv_heads * head_dim +
                            kv_head_idx * head_dim +
                            head_offset[None, :]) # (BLOCK_N, head_dim)
         # Load Kj / Vj block - shape (BLOCK_N, head_dim)
-        kv_mask = kv_offset < full_seq_len
         k_j = tl.load(k_cache_ptr + kv_cache_offset, mask=kv_mask[:, None], other=0.0)
         v_j = tl.load(v_cache_ptr + kv_cache_offset, mask=kv_mask[:, None], other=0.0)
         
@@ -302,12 +305,14 @@ def flash_attention_prefill(
     block_tables: torch.Tensor | None = None
 ) -> torch.Tensor:
     """
-    Flash Attention for prefill phase with variable-length sequences.
+    Flash Attention for prefill with variable-length sequences.
+    If block_tables is None, exec normal prefill (without cache), the input length of q is the same as k/v;
+    otherwise, exec chunked prefill (with cache), input k should be k_cache, v should be v_cache.
     
     Args:
         q: (total_tokens, num_heads, head_dim)
-        k: (total_tokens, num_kv_heads, head_dim)
-        v: (total_tokens, num_kv_heads, head_dim)
+        k: (total_tokens, num_kv_heads, head_dim) if block_tables is None else (num_blocks, block_size, num_kv_heads, head_dim)
+        v: (total_tokens, num_kv_heads, head_dim) if block_tables is None else (num_blocks, block_size, num_kv_heads, head_dim)
         scale: attention scale factor
         num_heads: number of attention query heads
         num_kv_heads: number of attention kv heads
@@ -317,7 +322,7 @@ def flash_attention_prefill(
         max_seqlen_q: maximum sequence length of queries
         max_seqlen_k: maximum sequence length of key/value
         block_size: block size
-        block_tables: (batch_size, max_num_blocks)
+        block_tables: (batch_size, max_num_blocks) or None
 
     Returns:
         output: (total_tokens, num_heads, head_dim)
@@ -411,7 +416,7 @@ def flash_attention_decode_with_cache_kernel(
 
     l_i = 0.0  # init unscaled sum of row
     m_i = -1e10  # init max value of row as -inf
-    acc = tl.zeros([head_dim,], dtype=tl.float32) - 1e10  # init unscaled accumulate output
+    acc = tl.zeros([head_dim,], dtype=tl.float32)  # init unscaled accumulate output
 
     # Loop process K, V caches
     # each loop responsible for BLOCK_N K/V caches
@@ -421,7 +426,7 @@ def flash_attention_decode_with_cache_kernel(
         kv_mask = kv_offset < cache_seq_len
 
         # Compute attention scores: qK^T / sqrt(d) - shape (BLOCK_N, )
-        s = tl.zeros([BLOCK_N], dtype=tl.float32)
+        s = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
 
         # Load k for each valid position and compute scores
         for j in tl.range(BLOCK_N):

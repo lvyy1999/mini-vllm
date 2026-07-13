@@ -5,8 +5,6 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers import AutoConfig
 
-
-
 def default_weight_loader(param: nn.Parameter, weight: torch.Tensor):
     """Default weight loader that copies weight data to parameter."""
     if param.shape != weight.shape:

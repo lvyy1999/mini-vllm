@@ -216,39 +216,33 @@ class LlamaForCausalLM(nn.Module):
         "gate_proj": ('gate_up_proj', 0),
         "up_proj": ('gate_up_proj', 1),
     }
-    def __init__(
-            self,
-            vocab_size: int = 128256,
-            hidden_size: int = 2048,
-            head_dim: int = 64,
-            num_qo_heads: int = 32,
-            num_kv_heads: int = 8,
-            has_attn_bias: bool = False,
-            rms_norm_epsilon: float = 1e-5,
-            rope_base: int = 500000,
-            max_position_embeddings: int = 131072,
-            intermediate_size: int = 8192,
-            ffn_bias: bool = False,
-            num_layers: int = 16,
-            block_size: int = 256,
-            tie_word_embeddings: bool = True
-        ):
+    def __init__(self, config: dict, block_size: int = 256):
+        """
+        Args:
+            config (dict): config of Llama
+            block_size (int): size of kv cache block, used for flash paged attention
+        """
         super().__init__()
+        vocab_size = config.get("vocab_size", 128256)
+        hidden_size = config.get("hidden_size", 2048)
+        num_qo_heads = config.get("num_qo_heads", 32)
+        head_dim = config["head_dim"] if "head_dim" in config else hidden_size // num_qo_heads
         self.model = LlamaModel(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             head_dim=head_dim,
             num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            has_attn_bias=has_attn_bias,
-            rms_norm_epsilon=rms_norm_epsilon,
-            rope_base=rope_base,
-            max_position_embeddings=max_position_embeddings,
-            intermediate_size=intermediate_size,
-            ffn_bias=ffn_bias,
-            num_layers=num_layers,
+            num_kv_heads=config.get("num_kv_heads", 8),
+            has_attn_bias=config.get("has_attn_bias", False),
+            rms_norm_epsilon=config.get("rms_norm_epsilon", 1e-5),
+            rope_base=config.get("rope_base", 500000),
+            max_position_embeddings=config.get("max_position_embeddings", 32768),
+            intermediate_size=config.get("intermediate_size", 8192),
+            ffn_bias=config.get("ffn_bias", False),
+            num_layers=config.get("num_layers", 16),
             block_size=block_size,
         )
+        tie_word_embeddings = config.get("tie_word_embeddings", True)
         self.lm_head = ParallelLMHead(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
