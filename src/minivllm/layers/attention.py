@@ -298,9 +298,9 @@ def flash_attention_prefill(
     num_kv_heads: int,
     head_dim: int,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    cu_seqlens_k: torch.Tensor | None = None,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
     block_size: int = 0,
     block_tables: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -346,12 +346,14 @@ def flash_attention_prefill(
 
     # Calculate grid dimensions
     num_batches = cu_seqlens_q.shape[0] - 1
+    max_seqlen_q = max_seqlen_q if max_seqlen_q > 0 else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     num_blocks = triton.cdiv(max_seqlen_q, BLOCK_M)
     grid = (num_heads, num_blocks, num_batches)
     # launch num_heads × num_blocks x num_batches threads
     if block_tables is not None: # chunked prefill
         assert block_size > 0, "block_size must be > 0 while chunked prefilling"
         max_num_blocks = block_tables.shape[1]
+        cu_seqlens_k = cu_seqlens_k or cu_seqlens_q
         flash_attention_prefill_with_cache_kernel[grid](
             q, k, v, output,
             scale,

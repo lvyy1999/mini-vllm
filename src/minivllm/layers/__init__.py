@@ -1,5 +1,5 @@
 from .activation import SiLUAndMul
-from .attention import Attention
+from .attention import Attention, flash_attention_prefill, flash_attention_decode
 from .embedding_head import ParallelLMHead, VocabParallelEmbedding
 from .rmsnorm import RMSNorm
 from .linear import ColumnParallelLinear, MergedColumnParallelLinear, QKVColumnParallelLinear, RowParallelLinear
