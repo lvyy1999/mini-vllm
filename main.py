@@ -3,10 +3,9 @@ import sys
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from minivllm import LLM, SamplingParams
-
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+from minivllm import LLM, SamplingParams
 
 # config of used custom model
 model_config = {
@@ -35,7 +34,11 @@ def main():
     model = "Qwen/Qwen3-0.6B"
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=path)
-    llm = LLM(enforce_eager=True, model_name_or_path=model, custom_model_config=model_config)
+    llm = LLM(
+        enforce_eager=True,
+        model_name_or_path=model,
+        custom_model_config=model_config
+    )
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [

@@ -49,7 +49,11 @@ def cuda_sync():
         torch.cuda.synchronize()
 
 def run_minivllm(tokenizer):
-    llm = MiniVLLM(enforce_eager=True, model_name_or_path=MODEL_NAME, custom_model_config=MODEL_CONFIG)
+    llm = MiniVLLM(
+        enforce_eager=True,
+        model_name_or_path=MODEL_NAME,
+        custom_model_config=MODEL_CONFIG
+    )
     sampling = MiniSamplingParams(
         temperature=0.6,
         max_tokens=OUTPUT_TOKENS,

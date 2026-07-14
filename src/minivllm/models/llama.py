@@ -28,10 +28,11 @@ class LlamaAttn(nn.Module):
 
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_qo_heads
         self.scale = self.head_dim ** -0.5
+        self.block_size = block_size
         self.q_size = head_dim * self.num_heads
         self.kv_size = head_dim * self.num_kv_heads
 
-        self.qkv_projection = QKVColumnParallelLinear(
+        self.qkv_proj = QKVColumnParallelLinear(
             hidden_size=hidden_size,
             head_dim=head_dim,
             num_heads=num_qo_heads,
@@ -49,11 +50,11 @@ class LlamaAttn(nn.Module):
         )
 
         self.attention = Attention(
-            num_heads=num_qo_heads,
-            head_dim=head_dim,
-            scale=self.scale,
-            num_kv_heads=num_kv_heads,
-            block_size=block_size,
+            self.num_heads,
+            self.head_dim,
+            self.scale,
+            self.num_kv_heads,
+            self.block_size
         )
 
         self.o_proj = RowParallelLinear(
@@ -67,7 +68,7 @@ class LlamaAttn(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_projection(x)
+        qkv = self.qkv_proj(x)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)

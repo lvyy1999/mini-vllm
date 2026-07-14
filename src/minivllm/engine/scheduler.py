@@ -59,7 +59,7 @@ class Scheduler:
             scheduled_seqs.append(seq)
 
         if scheduled_seqs: # prefill seqs not empty
-            return scheduled_seqs, True
+            return scheduled_seqs, num_batched_tokens, True
         
         # try schedule for decoding from running queue if not exceeding limits
         while self.running and len(scheduled_seqs) < self.max_num_sequences and num_batched_tokens < self.max_num_batched_tokens:

@@ -1,8 +1,10 @@
 import os
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class Config:
+    # engine config
     max_num_batched_tokens: int = 16384
     gpu_memory_utilization: float = 0.9
     max_num_sequences: int = 512
@@ -13,8 +15,9 @@ class Config:
     eos_token_id: int = -1
     world_size: int = 1
 
+    # custom model config
     model_name_or_path: str = ""
-    custom_model_config: dict | None = None
+    custom_model_config: dict = field(default_factory=dict)
 
     def __post_init__(self):
         assert 1 <= self.world_size <= 8

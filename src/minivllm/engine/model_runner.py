@@ -40,9 +40,17 @@ class ModelRunner:
         model_name = Path(path_str).name
         match model_name:
             case 'Qwen3-0.6B':
-                self.model = Qwen3ForCausalLM(config.custom_model_config)
+                self.num_layers = config.custom_model_config.get('num_hidden_layers', 28)
+                self.num_kv_heads = config.custom_model_config.get('num_key_value_heads', 8)
+                self.head_dim = config.custom_model_config.get('head_dim', 128)
+                self.hidden_size = config.custom_model_config.get('hidden_size', 1024)
+                self.model = Qwen3ForCausalLM(config.custom_model_config, self.block_size)
             case 'Llama-3.2-1B-Instruct':
-                self.model = LlamaForCausalLM(config.custom_model_config)
+                self.num_layers = config.custom_model_config.get('num_layers', 16)
+                self.num_kv_heads = config.custom_model_config.get('num_kv_heads', 8)
+                self.head_dim = config.custom_model_config.get('head_dim', 64)
+                self.hidden_size = config.custom_model_config.get('hidden_size', 2048)
+                self.model = LlamaForCausalLM(config.custom_model_config, self.block_size)
             case _:
                 raise Exception(f"Unsupported model: {config.model_name_or_path}")
         # load pretrained model weights
@@ -142,12 +150,12 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batched_tokens']
-        max_model_length = self.config['max_model_length']
+        max_tokens = self.config.max_num_batched_tokens
+        max_model_length = self.config.max_model_length
         seq_len = min(max_tokens, max_model_length)
-        batch_size = min(max_tokens // seq_len, self.config['max_num_sequences'])
+        batch_size = min(max_tokens // seq_len, self.config.max_num_sequences)
         seqs = [
-            Sequence([0] * seq_len, self.config['block_size']) for _ in range(batch_size)
+            Sequence([0] * seq_len) for _ in range(batch_size)
         ]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
@@ -158,20 +166,15 @@ class ModelRunner:
     def allocate_kv_cache(self):
         # find all available memory
         free_mem, total_mem = torch.cuda.mem_get_info()
-        avail_free_mem = free_mem * self.config['gpu_memory_utilization']
+        avail_free_mem = free_mem * self.config.gpu_memory_utilization
         peak_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.peak']
         current_mem_usage = torch.cuda.memory_stats()['allocated_bytes.all.current']
         # reserve some room for peak memory usage during model execution
         available_mem = avail_free_mem - (peak_mem_usage - current_mem_usage)
-        
-        # get parameters to compute kv cache size
-        num_layers = self.config['num_layers']
-        num_kv_heads = self.config['num_kv_heads'] // self.world_size
-        head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
         # check whether the current free memory can hold at least one block
-        # compute the actual byte required of each block
-        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * self.default_dtype.itemsize
+        # calculate the actual bytes required of each block
+        block_bytes = 2 * self.num_layers * self.block_size * self.num_kv_heads * self.head_dim * self.default_dtype.itemsize
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
@@ -195,17 +198,17 @@ class ModelRunner:
             # (initialized afterward on rank-0) never allocates more blocks than any
             # rank can physically hold.
             dist.all_reduce(per_rank_max_blocks_tensor, op=dist.ReduceOp.MIN)
-            self.config['max_cached_blocks'] = per_rank_max_blocks_tensor.item()
+            self.config.max_cache_blocks = per_rank_max_blocks_tensor.item()
         else:
             # Single GPU: no cross-rank sync needed; use the local value directly.
-            self.config['max_cached_blocks'] = num_available_kv_blocks
+            self.config.max_cache_blocks = num_available_kv_blocks
         if self.rank == 0:
-            print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
+            print(f"[Rank 0] Global max_cached_blocks (min): {self.config.max_cache_blocks}")
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        kv_cache = torch.zeros(2, num_layers, self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        kv_cache = torch.zeros(2, self.num_layers, self.config.max_cache_blocks, self.block_size, self.num_kv_heads, self.head_dim, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -376,24 +379,23 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = min(self.config['max_num_seqs'], 512)
-        self.max_graph_bs = max_bs
-        max_len = self.config['max_model_length']
+        self.max_graph_bs = min(self.config.max_num_sequences, 512)
+        max_len = self.config.max_model_length
         max_num_blocks = (max_len + self.block_size - 1) // self.block_size
         # for decoding, input is always of shape (batch_size, 1)
-        input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
-        positions = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        input_ids = torch.zeros(self.max_graph_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        positions = torch.zeros(self.max_graph_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # for paged attention
         # where to write new KV values in the cache
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
+        slot_mapping = torch.zeros(self.max_graph_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         # how many tokens each sequence has processed
-        context_lens = torch.zeros(max_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
+        context_lens = torch.zeros(self.max_graph_bs, dtype=torch.int32, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
+        block_tables = torch.zeros(self.max_graph_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
         # output logits
-        outputs = torch.zeros(max_bs, self.config['hidden_size'], device=f'cuda:{self.rank}')
+        outputs = torch.zeros(self.max_graph_bs, self.hidden_size, device=f'cuda:{self.rank}')
         # graphs to be captured for different batch sizes
-        batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        batch_sizes = [1, 2, 4, 8] + list(range(16, self.max_graph_bs + 1, 16))
         graph_pool = None
 
         for bs in reversed(batch_sizes):

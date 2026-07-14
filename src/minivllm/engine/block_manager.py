@@ -17,7 +17,7 @@ class Block:
 
     def reset(self):
         self.hash = -1 
-        self.ref_count = 0
+        self.ref_count = 1
         self.token_ids = []
 
 # given token_ids, compute the hash value
@@ -130,7 +130,7 @@ class BlockManager:
         
     def deallocate(self, seq: Sequence) -> None:
         # update block information; later allocate, earlier deallocate
-        for block_id in seq.block_table.reverse():
+        for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
@@ -163,6 +163,6 @@ class BlockManager:
             block_id = seq.block_table[i]
             block = self.blocks[block_id]
             token_ids = seq.block(i)
-            block.update(h, token_ids)
             h = compute_hash(token_ids, h)
+            block.update(h, token_ids)
             self.hash_to_block_id[h] = block_id

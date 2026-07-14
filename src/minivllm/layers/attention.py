@@ -353,7 +353,7 @@ def flash_attention_prefill(
     if block_tables is not None: # chunked prefill
         assert block_size > 0, "block_size must be > 0 while chunked prefilling"
         max_num_blocks = block_tables.shape[1]
-        cu_seqlens_k = cu_seqlens_k or cu_seqlens_q
+        cu_seqlens_k = cu_seqlens_k if cu_seqlens_k is not None else cu_seqlens_q
         flash_attention_prefill_with_cache_kernel[grid](
             q, k, v, output,
             scale,
