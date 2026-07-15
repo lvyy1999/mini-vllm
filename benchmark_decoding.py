@@ -9,6 +9,14 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from minivllm.layers import flash_attention_decode
 
 
+def report_correctness(name: str, reference: torch.Tensor, candidate: torch.Tensor, atol=2e-2, rtol=2e-2):
+    max_abs_err = (reference - candidate).abs().max().item()
+    is_close = torch.allclose(reference, candidate, atol=atol, rtol=rtol)
+    status = "PASS" if is_close else "FAIL"
+    print(f"   Correctness vs Naive PyTorch [{name}]: {status}, max_abs_err={max_abs_err:.6f}")
+    return is_close
+
+
 def decode_torch_optimized(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -216,6 +224,7 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     pytorch_time = (time.perf_counter() - start) / num_iterations
     results['Optimized PyTorch'] = pytorch_time
     print(f"   Time: {pytorch_time*1000:.3f}ms")
+    report_correctness("Optimized PyTorch", out_naive, out_pytorch)
     
     # 3. Triton
     print("\n3. Testing Triton implementation...")
@@ -230,6 +239,7 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     triton_time = (time.perf_counter() - start) / num_iterations
     results['Triton'] = triton_time
     print(f"   Time: {triton_time*1000:.3f}ms")
+    report_correctness("Triton", out_naive, out_triton)
     
     return results
 

@@ -1,12 +1,9 @@
 import sys
 from pathlib import Path
+import gc
 import time
 import torch
-from transformers import AutoTokenizer,AutoModelForCausalLM
-
-# ===== vllm =====
-from vllm import LLM as VLLM
-from vllm import SamplingParams as VLLMSamplingParams
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -54,7 +51,25 @@ def cuda_sync():
         torch.cuda.synchronize()
 
 
-def run_minivllm(tokenizer):
+def cleanup_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+def build_chat_prompts(tokenizer):
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in PROMPTS
+    ]
+
+
+def run_minivllm(prompts):
     llm = MiniVLLM(
         enforce_eager=True,
         model_name_or_path=MODEL_NAME,
@@ -65,15 +80,6 @@ def run_minivllm(tokenizer):
         temperature=0.6,
         max_tokens=OUTPUT_TOKENS,
     )
-
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in PROMPTS
-    ]
 
     # warmup
     for _ in range(WARMUP_STEPS):
@@ -88,37 +94,40 @@ def run_minivllm(tokenizer):
     total_tokens = sum(len(output['token_ids']) for output in outputs)
     latency = end - start
 
-    return {
+    result = {
         "latency": latency,
         "tokens": total_tokens,
         "tps": total_tokens / latency,
     }
+    del llm, outputs
+    cleanup_cuda()
+    return result
 
 
-def run_vllm(tokenizer):
+def run_vllm(tokenizer, prompts):
+    try:
+        from vllm import LLM as VLLM
+        from vllm import SamplingParams as VLLMSamplingParams
+    except ImportError as exc:
+        return {"error": f"vLLM is not installed: {exc}"}
+
+    prompt_token_lens = [len(tokenizer.encode(prompt)) for prompt in prompts]
+    max_model_len = max(prompt_token_lens) + OUTPUT_TOKENS + 16
+
     # vLLM
     llm = VLLM(
         model=MODEL_NAME,
         tokenizer=MODEL_NAME,
-        trust_remote_code=False, 
-        gpu_memory_utilization=0.75,  
-        max_model_len=256, 
-        speculative_config=None, 
+        trust_remote_code=False,
+        gpu_memory_utilization=0.75,
+        max_model_len=max_model_len,
+        speculative_config=None,
     )
 
     sampling = VLLMSamplingParams(
         temperature=0.6,
         max_tokens=OUTPUT_TOKENS,
     )
-
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in PROMPTS
-    ]
 
     # warmup
     for _ in range(WARMUP_STEPS):
@@ -133,16 +142,19 @@ def run_vllm(tokenizer):
     total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
     latency = end - start
 
-    return {
+    result = {
         "latency": latency,
         "tokens": total_tokens,
         "tps": total_tokens / latency,
     }
+    del llm, outputs
+    cleanup_cuda()
+    return result
 
 
-def run_transformers_test(tokenizer):
+def run_transformers_test(tokenizer, prompts):
     # transformers
-    inputs = tokenizer(PROMPTS, return_tensors="pt", padding=True, truncation=True).to(device)
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
 
     # Prepare attention_mask explicitly
@@ -151,36 +163,43 @@ def run_transformers_test(tokenizer):
     # warmup
     for _ in range(WARMUP_STEPS):
         with torch.no_grad():
-            model.generate(inputs['input_ids'], attention_mask=attention_mask, max_length=OUTPUT_TOKENS)
+            model.generate(inputs['input_ids'], attention_mask=attention_mask, max_new_tokens=OUTPUT_TOKENS)
 
     start = time.perf_counter()
     with torch.no_grad():
-        outputs = model.generate(inputs['input_ids'], attention_mask=attention_mask, max_length=OUTPUT_TOKENS)
+        outputs = model.generate(inputs['input_ids'], attention_mask=attention_mask, max_new_tokens=OUTPUT_TOKENS)
     end = time.perf_counter()
 
-    total_tokens = sum(len(output) for output in outputs)
+    input_lens = attention_mask.sum(dim=1).tolist()
+    total_tokens = sum(max(0, len(output) - int(input_len)) for output, input_len in zip(outputs, input_lens))
     latency = end - start
 
     tps = total_tokens / latency
 
-    return {
+    result = {
         "latency": latency,
         "tokens": total_tokens,
         "tps": tps,
     }
+    del model, outputs
+    cleanup_cuda()
+    return result
 
 
 def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, padding_side='left')
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    prompts = build_chat_prompts(tokenizer)
 
     print("Running minivllm benchmark...")
-    mini = run_minivllm(tokenizer)
+    mini = run_minivllm(prompts)
 
     print("Running vLLM benchmark...")
-    vllm = run_vllm(tokenizer)
+    vllm = run_vllm(tokenizer, prompts)
 
     print("Running transformers benchmark...")
-    transformers = run_transformers_test(tokenizer)
+    transformers = run_transformers_test(tokenizer, prompts)
 
 
     results = {
@@ -193,7 +212,10 @@ def main():
     for k, v in results.items():
         print(f"{k}:")
         for kk, vv in v.items():
-            print(f"  {kk}: {vv:.4f}")
+            if isinstance(vv, (int, float)):
+                print(f"  {kk}: {vv:.4f}")
+            else:
+                print(f"  {kk}: {vv}")
 
 
 if __name__ == "__main__":
