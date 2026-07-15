@@ -3,6 +3,7 @@ import torch.nn as nn
 
 
 class SamplerLayer(nn.Module):
+
     def __init__(self):
         super().__init__()
 

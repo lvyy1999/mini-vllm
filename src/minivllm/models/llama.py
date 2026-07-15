@@ -5,47 +5,47 @@ from typing import Tuple
 
 from minivllm.layers import *
 
+
 class LlamaAttn(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
         head_dim: int,
-        num_qo_heads: int,
+        num_heads: int,
         num_kv_heads: int,
-        has_attn_bias: bool = False,
-        rope_base: int = 500000,
-        max_position_embeddings: int = 131072,
-        block_size: int = 256,
+        max_position: int = 131072,
+        qkv_bias: bool = False,
+        base: float = 500000.0,
     ):
         super().__init__()
         self.tp_size = dist.get_world_size()
 
-        self.total_num_heads = num_qo_heads
-        self.num_heads = num_qo_heads // self.tp_size
+        self.total_num_heads = num_heads
+        self.num_heads = num_heads // self.tp_size
 
-        self.total_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_qo_heads
+        self.total_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_heads = self.total_num_kv_heads // self.tp_size
 
-        self.head_dim = head_dim if head_dim is not None else hidden_size // num_qo_heads
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_heads
         self.scale = self.head_dim ** -0.5
-        self.block_size = block_size
         self.q_size = head_dim * self.num_heads
         self.kv_size = head_dim * self.num_kv_heads
 
         self.qkv_proj = QKVColumnParallelLinear(
             hidden_size=hidden_size,
             head_dim=head_dim,
-            num_heads=num_qo_heads,
+            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
-            bias=has_attn_bias,
+            bias=qkv_bias,
         )
         
         # Llama 3.2 does not have q_norm or k_norm
 
         self.rotary_emb = RotaryEmbedding(
-            base=rope_base,
             head_dim=head_dim,
-            max_seq_len=max_position_embeddings,
+            max_position=max_position,
+            base=base,
             is_llama3=True
         )
 
@@ -54,7 +54,6 @@ class LlamaAttn(nn.Module):
             self.head_dim,
             self.scale,
             self.num_kv_heads,
-            self.block_size
         )
 
         self.o_proj = RowParallelLinear(
@@ -78,7 +77,9 @@ class LlamaAttn(nn.Module):
         o = o.flatten(start_dim=1)
         return self.o_proj(o)
 
+
 class LlamaMLP(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -102,34 +103,33 @@ class LlamaMLP(nn.Module):
         x = self.down_proj(self.activation(self.gate_up_proj(x)))
         return x
 
+
 class LlamaDecoderLayer(nn.Module):
+
     def __init__(
         self,
         hidden_size: int = 2048,
         head_dim: int = 64,
-        num_qo_heads: int = 32,
+        num_heads: int = 32,
         num_kv_heads: int = 8,
-        has_attn_bias: bool = False,
-        rms_norm_epsilon: float = 1e-06,
-        rope_base: int = 500000,
-        max_position_embeddings: int = 131072,
+        max_position: int = 131072,
+        rms_norm_eps: float = 1e-5,
         intermediate_size: int = 8192,
+        qkv_bias: bool = False,
         ffn_bias: bool = False,
-        block_size: int = 256,
+        base: float = 500000.0,
     ):
         super().__init__()
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
+        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = LlamaAttn(
             hidden_size=hidden_size,
             head_dim=head_dim,
-            num_qo_heads=num_qo_heads,
+            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
-            has_attn_bias=has_attn_bias,
-            rope_base=rope_base,
-            max_position_embeddings=max_position_embeddings,
-            block_size=block_size,
-        )
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
+            max_position=max_position,
+            qkv_bias=qkv_bias,
+            base=base)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = LlamaMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -151,27 +151,28 @@ class LlamaDecoderLayer(nn.Module):
         x, residual = self.post_attention_layernorm(x, residual)
         x = self.mlp(x)
         return x, residual
-    
+
+
 # LlamaModel
-# embedding
-# layers stack
+# embedding ->
+# layers stack ->
 # final layer norm
 class LlamaModel(nn.Module):
+
     def __init__(
         self,
         vocab_size: int = 128256,
         hidden_size: int = 2048,
         head_dim: int = 64,
-        num_qo_heads: int = 32,
+        num_heads: int = 32,
         num_kv_heads: int = 8,
-        has_attn_bias: bool = False,
-        rms_norm_epsilon: float = 1e-6,
-        rope_base: int = 500000,
-        max_position_embeddings: int = 131072,
+        max_position: int = 131072,
+        rms_norm_eps: float = 1e-5,
         intermediate_size: int = 8192,
+        qkv_bias: bool = False,
         ffn_bias: bool = False,
+        base: float = 500000.0,
         num_layers: int = 16,
-        block_size: int = 256,
     ):
         super().__init__()
 
@@ -183,18 +184,17 @@ class LlamaModel(nn.Module):
             LlamaDecoderLayer(
                 hidden_size=hidden_size,
                 head_dim=head_dim,
-                num_qo_heads=num_qo_heads,
+                num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
-                has_attn_bias=has_attn_bias,
-                rms_norm_epsilon=rms_norm_epsilon,
-                rope_base=rope_base,
-                max_position_embeddings=max_position_embeddings,
+                max_position=max_position,
+                rms_norm_eps=rms_norm_eps,
                 intermediate_size=intermediate_size,
+                qkv_bias=qkv_bias,
                 ffn_bias=ffn_bias,
-                block_size=block_size,
+                base=base
             ) for _ in range(num_layers)
         ])
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_epsilon)
+        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(
             self,
@@ -217,33 +217,39 @@ class LlamaForCausalLM(nn.Module):
         "gate_proj": ('gate_up_proj', 0),
         "up_proj": ('gate_up_proj', 1),
     }
-    def __init__(self, config: dict, block_size: int = 256):
-        """
-        Args:
-            config (dict): config of Llama
-            block_size (int): size of kv cache block, used for flash paged attention
-        """
+
+    def __init__(
+            self,
+            # the default values of followed params are the same as meta-llama/Llama-3.2-1B-Instruct
+            vocab_size: int = 128256,
+            hidden_size: int = 2048,
+            head_dim: int = 64,
+            num_heads: int = 32,
+            num_kv_heads: int = 8,
+            max_position: int = 131072,
+            rms_norm_eps: float = 1e-5,
+            intermediate_size: int = 8192,
+            qkv_bias: bool = False,
+            ffn_bias: bool = False,
+            base: float = 500000.0,
+            num_layers: int = 16,
+            tie_word_embeddings: bool = True,
+    ):
         super().__init__()
-        vocab_size = config.get("vocab_size", 128256)
-        hidden_size = config.get("hidden_size", 2048)
-        num_qo_heads = config.get("num_qo_heads", 32)
-        head_dim = config["head_dim"] if "head_dim" in config else hidden_size // num_qo_heads
         self.model = LlamaModel(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             head_dim=head_dim,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=config.get("num_kv_heads", 8),
-            has_attn_bias=config.get("has_attn_bias", False),
-            rms_norm_epsilon=config.get("rms_norm_epsilon", 1e-5),
-            rope_base=config.get("rope_base", 500000),
-            max_position_embeddings=config.get("max_position_embeddings", 32768),
-            intermediate_size=config.get("intermediate_size", 8192),
-            ffn_bias=config.get("ffn_bias", False),
-            num_layers=config.get("num_layers", 16),
-            block_size=block_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            max_position=max_position,
+            rms_norm_eps=rms_norm_eps,
+            intermediate_size=intermediate_size,
+            qkv_bias=qkv_bias,
+            ffn_bias=ffn_bias,
+            base=base,
+            num_layers=num_layers,
         )
-        tie_word_embeddings = config.get("tie_word_embeddings", True)
         self.lm_head = ParallelLMHead(
             vocab_size=vocab_size,
             hidden_size=hidden_size,

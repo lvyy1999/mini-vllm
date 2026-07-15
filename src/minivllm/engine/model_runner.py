@@ -16,6 +16,7 @@ from minivllm.utils.config import Config
 
 
 class ModelRunner:
+
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         self.rank = rank
@@ -36,25 +37,52 @@ class ModelRunner:
         torch.set_default_device(f'cuda:{rank}')
 
         # set model
-        path_str = config.model_name_or_path
-        model_name = Path(path_str).name
+        model_name = Path(config.model_name_or_path).name
         match model_name:
             case 'Qwen3-0.6B':
                 self.num_layers = config.custom_model_config.get('num_hidden_layers', 28)
                 self.num_kv_heads = config.custom_model_config.get('num_key_value_heads', 8)
                 self.head_dim = config.custom_model_config.get('head_dim', 128)
                 self.hidden_size = config.custom_model_config.get('hidden_size', 1024)
-                self.model = Qwen3ForCausalLM(config.custom_model_config, self.block_size)
+                self.model = Qwen3ForCausalLM(
+                    vocab_size=config.custom_model_config.get('vocab_size', 151936),
+                    hidden_size=self.hidden_size,
+                    num_heads=config.custom_model_config.get('num_attention_heads', 16),
+                    head_dim=self.head_dim,
+                    num_kv_heads=self.num_kv_heads,
+                    max_position=config.custom_model_config.get('max_position_embeddings', 40960),
+                    rms_norm_eps=config.custom_model_config.get('rms_norm_eps', 1e-6),
+                    intermediate_size=config.custom_model_config.get('intermediate_size', 3072),
+                    qkv_bias=config.custom_model_config.get('attention_bias', False),
+                    base=config.custom_model_config.get('rope_theta', 1000000.0),
+                    num_layers=self.num_layers,
+                    tie_word_embeddings=config.custom_model_config.get('tie_word_embeddings', True),
+                )
             case 'Llama-3.2-1B-Instruct':
-                self.num_layers = config.custom_model_config.get('num_layers', 16)
-                self.num_kv_heads = config.custom_model_config.get('num_kv_heads', 8)
+                self.num_layers = config.custom_model_config.get('num_hidden_layers', 16)
+                self.num_kv_heads = config.custom_model_config.get('num_key_value_heads', 8)
                 self.head_dim = config.custom_model_config.get('head_dim', 64)
                 self.hidden_size = config.custom_model_config.get('hidden_size', 2048)
-                self.model = LlamaForCausalLM(config.custom_model_config, self.block_size)
+                self.model = LlamaForCausalLM(
+                    vocab_size=config.custom_model_config.get('vocab_size', 128256),
+                    hidden_size=self.hidden_size,
+                    num_heads=config.custom_model_config.get('num_attention_heads', 32),
+                    head_dim=self.head_dim,
+                    num_kv_heads=self.num_kv_heads,
+                    max_position=config.custom_model_config.get('max_position_embeddings', 131072),
+                    rms_norm_eps=config.custom_model_config.get('rms_norm_eps', 1e-5),
+                    intermediate_size=config.custom_model_config.get('intermediate_size', 8192),
+                    qkv_bias=config.custom_model_config.get('attention_bias', False),
+                    ffn_bias=config.custom_model_config.get('mlp_bias', False),
+                    base=config.custom_model_config.get('rope_theta', 500000.0),
+                    num_layers=self.num_layers,
+                    tie_word_embeddings=config.custom_model_config.get('tie_word_embeddings', True),
+                )
             case _:
                 raise Exception(f"Unsupported model: {config.model_name_or_path}")
         # load pretrained model weights
         load_weights_from_checkpoint(self.model, config.model_name_or_path)
+
         # set sampler
         self.sampler = SamplerLayer()
         # warm up model so that we know peak memory usage
@@ -217,7 +245,8 @@ class ModelRunner:
                 layer_id += 1
 
     # prepare block tables with padding for chunked prefill or decode
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    @classmethod
+    def prepare_block_tables(cls, seqs: list[Sequence]):
         max_num_blocks = max(len(seq.block_table) for seq in seqs)
         block_tables = [
             seq.block_table + [-1] * (max_num_blocks - len(seq.block_table)) for seq in seqs
@@ -323,7 +352,8 @@ class ModelRunner:
         return input_ids, positions
 
     # prepare the temperatures for sample
-    def prepare_sample(self, seqs: list[Sequence]) -> Tensor:
+    @classmethod
+    def prepare_sample(cls, seqs: list[Sequence]) -> Tensor:
         temperatures = [seq.temperature for seq in seqs]
         return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
@@ -366,8 +396,8 @@ class ModelRunner:
             input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        # only sample when rank == 0
-        token_ids = self.sampler(logits, temperatures) if self.rank == 0 else None
+        # only sample when rank == 0, and convert them to a list
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

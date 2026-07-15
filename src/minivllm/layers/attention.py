@@ -1,8 +1,10 @@
-import triton 
-import triton.language as tl
-from minivllm.utils import get_context
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
+
+from minivllm.utils import get_context
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -50,6 +52,7 @@ def store_kvcache_kernel(
     tl.store(k_cache_ptr + cache_offsets, key)
     tl.store(v_cache_ptr + cache_offsets, value)
 
+
 def store_kvcache(
     key: torch.Tensor, 
     value: torch.Tensor, 
@@ -91,6 +94,7 @@ def store_kvcache(
         head_dim=head_dim,
     )
 
+
 @triton.jit
 def flash_attention_prefill_with_cache_kernel(
     q_ptr, # (total_q, num_heads, head_dim)
@@ -112,9 +116,9 @@ def flash_attention_prefill_with_cache_kernel(
     """
     Flash Attention kernel for chunked prefill with K/V cache.
     """
-    # Each thread responsible for one head of one group of queries of one batch of sequences
+    # Each thread responsible for one head of one block of queries of one batch of sequences
     head_idx = tl.program_id(0)  # head index
-    group_idx = tl.program_id(1) # group index
+    block_idx = tl.program_id(1) # block index
     batch_idx = tl.program_id(2) # batch index
 
     # Determine which KV head to use
@@ -132,7 +136,7 @@ def flash_attention_prefill_with_cache_kernel(
     batch_len_q = batch_end_q - batch_start_q # sequence length of queries in this batch
     
     # Early exit if this block is beyond sequence length
-    if group_idx * BLOCK_M >= batch_len_q:
+    if block_idx * BLOCK_M >= batch_len_q:
         return
 
     # Calculate the actual start position of queries in itself's sequence,
@@ -143,7 +147,7 @@ def flash_attention_prefill_with_cache_kernel(
     # each thread responsible for BLOCK_M * head_dim elements in Q
     # calculate the offsets of them
     head_offset = tl.arange(0, head_dim)
-    batch_offset_q = group_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    batch_offset_q = block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     q_offset = ((batch_start_q + batch_offset_q[:, None]) * num_heads * head_dim +
                 head_idx * head_dim +
                 head_offset[None, :])
@@ -162,14 +166,14 @@ def flash_attention_prefill_with_cache_kernel(
         # calculate the offsets of them
         kv_offset = kv_start + tl.arange(0, BLOCK_N) # (BLOCK_N, )
         kv_mask = kv_offset < full_seq_len  # (BLOCK_N, )
-        block_idx = kv_offset // block_size # (BLOCK_N, )
-        block_offset = kv_offset % block_size # (BLOCK_N, )
+        logical_block_idx = kv_offset // block_size # (BLOCK_N, )
+        logical_block_offset = kv_offset % block_size # (BLOCK_N, )
         physical_block_idx = tl.load(
-            block_tables_ptr + batch_idx * max_num_blocks + block_idx,
+            block_tables_ptr + batch_idx * max_num_blocks + logical_block_idx,
             mask=kv_mask, other=-1
         ) # (BLOCK_N, )
         kv_cache_offset = (physical_block_idx[:, None] * block_size * num_kv_heads * head_dim +
-                           block_offset[:, None] * num_kv_heads * head_dim +
+                           logical_block_offset[:, None] * num_kv_heads * head_dim +
                            kv_head_idx * head_dim +
                            head_offset[None, :]) # (BLOCK_N, head_dim)
         # Load Kj / Vj block - shape (BLOCK_N, head_dim)
@@ -289,24 +293,21 @@ def flash_attention_prefill_without_cache_kernel(
     # the offsets of them in O is the same as Q
     tl.store(o_ptr + q_offset, acc, mask=q_mask[:, None])
 
+
 def flash_attention_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
-    block_size: int = 0,
     block_tables: torch.Tensor | None = None
 ) -> torch.Tensor:
     """
     Flash Attention for prefill with variable-length sequences.
-    If block_tables is None, exec normal prefill (without cache), the input length of q is the same as k/v;
+    If block_tables is None, exec normal prefill (without cache);
     otherwise, exec chunked prefill (with cache), input k should be k_cache, v should be v_cache.
     
     Args:
@@ -314,48 +315,46 @@ def flash_attention_prefill(
         k: (total_tokens, num_kv_heads, head_dim) if block_tables is None else (num_blocks, block_size, num_kv_heads, head_dim)
         v: (total_tokens, num_kv_heads, head_dim) if block_tables is None else (num_blocks, block_size, num_kv_heads, head_dim)
         scale: attention scale factor
-        num_heads: number of attention query heads
-        num_kv_heads: number of attention kv heads
-        head_dim: head dimension
         cu_seqlens_q: cumulative sequence lengths of queries
         cu_seqlens_k: cumulative sequence lengths of key and value
         max_seqlen_q: maximum sequence length of queries
         max_seqlen_k: maximum sequence length of key/value
-        block_size: block size
         block_tables: (batch_size, max_num_blocks) or None
 
     Returns:
         output: (total_tokens, num_heads, head_dim)
 
     """
-    # Make queries contiguous
+    # make queries contiguous
     q = q.contiguous()
-    # Allocate memory for output
+    # allocate memory for output
     output = torch.empty_like(q)
+
+    # get needed params
+    _, num_heads, head_dim = q.shape
     
-    # Choose block sizes to avoid OOM on shared memory.
-    # Shared memory usage ~
+    # choose block sizes to avoid OOM on shared memory.
+    # shared memory usage ~
     #     (2 * BLOCK_M + 2 * BLOCK_N) * head_dim * sizeof(dtype)
     #     + BLOCK_M * BLOCK_N * sizeof(dtype)
     #     + 2 * BLOCK_M * sizeof(dtype)
     BLOCK_M = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
     BLOCK_N = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
 
-    k = k.contiguous()
-    v = v.contiguous()
-
-    # Calculate grid dimensions
+    # calculate grid dimensions
     num_batches = cu_seqlens_q.shape[0] - 1
     max_seqlen_q = max_seqlen_q if max_seqlen_q > 0 else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
     num_blocks = triton.cdiv(max_seqlen_q, BLOCK_M)
     grid = (num_heads, num_blocks, num_batches)
     # launch num_heads × num_blocks x num_batches threads
-    if block_tables is not None: # chunked prefill
-        assert block_size > 0, "block_size must be > 0 while chunked prefilling"
+    if block_tables is not None: # chunked prefill, k/v should be k_cache/v_cache
+        k_cache, v_cache = k, v # (num_blocks, block_size, num_kv_heads, head_dim)
+        block_size = k_cache.shape[1]
+        num_kv_heads = k_cache.shape[2]
         max_num_blocks = block_tables.shape[1]
         cu_seqlens_k = cu_seqlens_k if cu_seqlens_k is not None else cu_seqlens_q
         flash_attention_prefill_with_cache_kernel[grid](
-            q, k, v, output,
+            q, k_cache, v_cache, output,
             scale,
             block_tables,
             cu_seqlens_q,
@@ -369,6 +368,9 @@ def flash_attention_prefill(
             BLOCK_N=BLOCK_N,
         )
     else: # normal prefill
+        k = k.contiguous() # (total_tokens, num_kv_heads, head_dim)
+        v = v.contiguous()
+        num_kv_heads = k.shape[1]
         flash_attention_prefill_without_cache_kernel[grid](
             q, k, v, output,
             scale,
@@ -381,6 +383,7 @@ def flash_attention_prefill(
         )
 
     return output
+
 
 @triton.jit
 def flash_attention_decode_with_cache_kernel(
@@ -434,15 +437,15 @@ def flash_attention_decode_with_cache_kernel(
         for j in tl.range(BLOCK_N):
             token_idx = kv_start + j
             if token_idx < cache_seq_len:
-                block_idx = token_idx // block_size
-                block_offset = token_idx % block_size
-                if block_idx < max_num_blocks:
+                logical_block_idx = token_idx // block_size
+                logical_block_offset = token_idx % block_size
+                if logical_block_idx < max_num_blocks:
                     # Look up physical block
-                    physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + block_idx)
+                    physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + logical_block_idx)
                     if physical_block_idx != -1:
                         # cache: (max_num_blocks, block_size, num_kv_heads, head_dim)
                         k_cache_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                          block_offset * num_kv_heads * head_dim +
+                                          logical_block_offset * num_kv_heads * head_dim +
                                           kv_head_idx * head_dim +
                                           head_offset)
                         # Load k
@@ -468,15 +471,15 @@ def flash_attention_decode_with_cache_kernel(
         for j in range(BLOCK_N):
             token_idx = kv_start + j
             if token_idx < cache_seq_len:
-                block_idx = token_idx // block_size
-                block_offset = token_idx % block_size
-                if block_idx < max_num_blocks:
+                logical_block_idx = token_idx // block_size
+                logical_block_offset = token_idx % block_size
+                if logical_block_idx < max_num_blocks:
                     # Look up physical block
-                    physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + block_idx)
+                    physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + logical_block_idx)
                     if physical_block_idx != -1:
                         # cache: (max_num_blocks, block_size, num_kv_heads, head_dim)
                         v_cache_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                          block_offset * num_kv_heads * head_dim +
+                                          logical_block_offset * num_kv_heads * head_dim +
                                           kv_head_idx * head_dim + head_offset)
                         # Load v
                         v = tl.load(v_cache_ptr + v_cache_offset)
@@ -498,12 +501,8 @@ def flash_attention_decode(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     scale: float,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    block_size: int,
+    cache_seqlens: torch.Tensor,
     block_tables: torch.Tensor,
-    cache_seqlens: torch.Tensor
 ) -> torch.Tensor:
     """
     Compute attention in decode mode using paged KV cache.
@@ -513,26 +512,25 @@ def flash_attention_decode(
         k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         scale: attention scale factor
-        num_heads: number of attention query heads
-        num_kv_heads: number of kv heads
-        head_dim: head dimension
-        block_size: block size
         block_tables: (batch_size, max_num_blocks)
-        cache_seqlens: (batch_size, )
+        cache_seqlens: (batch_size, 1)
 
     Returns:
         output: (batch_size, num_heads, head_dim)
 
     """
-    batch_size = q.shape[0]
+    # make q contiguous
+    q = q.contiguous()
+    # allocate memory for output
+    output = torch.empty_like(q)
+
+    # get needed params
+    batch_size, num_heads, head_dim = q.shape
+    block_size = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
     max_num_blocks = block_tables.shape[1]
     
-    # Make q contiguous
-    q = q.contiguous()
-    # Allocate memory for output
-    output = torch.empty_like(q)
-    
-    # Choose chunk size for processing K/V caches
+    # choose chunk size for processing K/V caches
     BLOCK_N = 64 if head_dim <= 128 else 32
 
     # each thread responsible for one head of one batch
@@ -558,20 +556,19 @@ def flash_attention_decode(
 
 
 class Attention(nn.Module):
+
     def __init__(
         self,
         num_heads: int,
         head_dim: int,
         scale: float = 1.0,
         num_kv_heads: int | None = None,
-        block_size: int = 16,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
-        self.block_size = block_size
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -584,18 +581,12 @@ class Attention(nn.Module):
         if context.is_prefill: # Prefill
             if context.block_tables is not None: # chunked prefill
                 k, v = k_cache, v_cache
-            o = flash_attention_prefill(q, k, v,
-                                        scale=self.scale, head_dim=self.head_dim,
-                                        num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+            o = flash_attention_prefill(q, k, v, scale=self.scale,
                                         cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
                                         max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
-                                        block_size=self.block_size, block_tables=context.block_tables)
+                                        block_tables=context.block_tables)
             return o
         else: # Decode
-            o = flash_attention_decode(q, k_cache, v_cache,
-                                       scale=self.scale, head_dim=self.head_dim,
-                                       num_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
-                                       block_size=self.block_size, block_tables=context.block_tables,
-                                       cache_seqlens=context.context_lens)
+            o = flash_attention_decode(q, k_cache, v_cache, scale=self.scale,
+                                       cache_seqlens=context.context_lens, block_tables=context.block_tables)
             return o
-

@@ -1,7 +1,10 @@
 import torch
 import time
-import triton 
+import triton
 import triton.language as tl
+
+from minivllm.layers import flash_attention_prefill
+
 
 # ============================================================================
 # 1. PyTorch Standard (O(N²) memory)
@@ -170,11 +173,6 @@ def naive_triton_attention(
     return output
 
 
-# ============================================================================
-# 3. Flash Attention (O(N) memory)
-# ============================================================================
-from minivllm.layers import flash_attention_prefill
-
 def find_crossover_point():
     """Find where flash attention becomes faster than naive"""
     
@@ -214,12 +212,12 @@ def find_crossover_point():
         
         # Flash Attention
         for _ in range(10):
-            _ = flash_attention_prefill(q, k, v, scale, num_heads, num_kv_heads, head_dim, cu_seqlens)
+            _ = flash_attention_prefill(q, k, v, num_heads, num_kv_heads, head_dim, cu_seqlens, scale)
         
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(50):
-            _ = flash_attention_prefill(q, k, v, scale, num_heads, num_kv_heads, head_dim, cu_seqlens)
+            _ = flash_attention_prefill(q, k, v, num_heads, num_kv_heads, head_dim, cu_seqlens, scale)
         torch.cuda.synchronize()
         flash_time = (time.perf_counter() - start) / 50
         
@@ -291,7 +289,6 @@ def analyze_kernel_launches():
 # ============================================================================
 # Benchmark
 # ============================================================================
-
 def setup_data(num_seqs, seq_len, num_heads, num_kv_heads, head_dim):
     total_tokens = num_seqs * seq_len
     device = 'cuda'
@@ -354,18 +351,17 @@ def benchmark(num_seqs, seq_len, num_heads=32, num_kv_heads=8, head_dim=128, num
     # 3. Flash
     print("\n[3/3] Flash Attention (O(N), online softmax)...")
     for _ in range(5):
-        _ = flash_attention_prefill(q, k, v, scale, num_heads, num_kv_heads, head_dim, cu_seqlens)
+        _ = flash_attention_prefill(q, k, v, scale, cu_seqlens)
     
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_iter):
-        outputs['flash'] = flash_attention_prefill(q, k, v, scale, num_heads, num_kv_heads, head_dim, cu_seqlens)
+        outputs['flash'] = flash_attention_prefill(q, k, v, scale, cu_seqlens)
     torch.cuda.synchronize()
     t = (time.perf_counter() - start) / num_iter
     results['Flash Attention (O(N))'] = t
     print(f"      {t*1000:.3f} ms")
     
-
 
 if __name__ == "__main__":
     print("\n" + "="*80)

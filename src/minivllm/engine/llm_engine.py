@@ -17,7 +17,9 @@ def run_worker(config, rank, event):
     model_runner = ModelRunner(config, rank, event)
     model_runner.loop()
 
+
 class LLMEngine:
+
     def __init__(self, **kwargs):
         # load config
         config_fields = {field.name for field in fields(Config)}

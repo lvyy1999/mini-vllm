@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 
+
 class SiLUAndMul(nn.Module):
     """
     A custom activation layer that applies the SiLU (Sigmoid Linear Unit) activation
@@ -16,4 +17,3 @@ class SiLUAndMul(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, y = x.chunk(2, -1)
         return F.silu(x) * y
-

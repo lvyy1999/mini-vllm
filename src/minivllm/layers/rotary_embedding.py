@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
 
+
 # apply rope between two adjacent elements
 def apply_rope_adjacent(
     x: torch.Tensor,
@@ -30,6 +31,7 @@ def apply_rope_adjacent(
     y[:, 1::2] = y_odd
     return y
 
+
 # apply rope between two elements at a distance of head_dim / 2
 def apply_rotary_pos_emb(
     x: torch.Tensor,
@@ -53,11 +55,12 @@ def apply_rotary_pos_emb(
 
 
 class RotaryEmbedding(nn.Module):
+
     def __init__(
         self,
-        base: int,
         head_dim: int,
-        max_seq_len: int = 2048,
+        max_position: int,
+        base: float = 10000.0,
         is_llama3: bool = False,
         # the following params are only used in llama3.2
         llama3_rope_factor: float = 32.0,
@@ -89,7 +92,7 @@ class RotaryEmbedding(nn.Module):
                 factor = (1 - smooth) / llama3_rope_factor + smooth
                 inv_freq = factor * inv_freq
 
-        positions = torch.arange(max_seq_len).float() # shape(max_seq_len, )
+        positions = torch.arange(max_position).float() # shape(max_seq_len, )
         angles = torch.outer(positions, inv_freq) # shape(max_seq_len, head_dim/2)
         cos = torch.cos(angles) # shape(max_seq_len, head_dim/2)
         sin = torch.sin(angles) # shape(max_seq_len, head_dim/2)
@@ -104,4 +107,3 @@ class RotaryEmbedding(nn.Module):
             apply_rotary_pos_emb(query, cos, sin),
             apply_rotary_pos_emb(key, cos, sin)
         )
-

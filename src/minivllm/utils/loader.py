@@ -2,14 +2,20 @@ import os
 import re
 import torch
 import torch.nn as nn
+
+# os.environ["HF_HUB_DISABLE_XET"] = "1"
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 from safetensors import safe_open
 from transformers import AutoConfig
+
 
 def default_weight_loader(param: nn.Parameter, weight: torch.Tensor):
     """Default weight loader that copies weight data to parameter."""
     if param.shape != weight.shape:
         raise ValueError(f"Shape mismatch: param {param.shape} vs weight {weight.shape}")
     param.data.copy_(weight)
+
 
 def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
     """

@@ -1,6 +1,5 @@
-import os
-from collections import defaultdict
 from dataclasses import dataclass, field
+
 
 @dataclass(slots=True)
 class Config:
@@ -17,6 +16,7 @@ class Config:
 
     # custom model config
     model_name_or_path: str = ""
+    # the config dict will be read in ModelRunner and
     custom_model_config: dict = field(default_factory=dict)
 
     def __post_init__(self):

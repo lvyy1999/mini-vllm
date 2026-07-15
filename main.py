@@ -5,30 +5,32 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+
 from minivllm import LLM, SamplingParams
 
 # config of used custom model
 model_config = {
-  "architectures": [
-    "Qwen3ForCausalLM"
-  ],
-  "attention_bias": False,
-  "bos_token_id": 151643,
-  "eos_token_id": 151645,
-  "head_dim": 128,
-  "hidden_size": 1024,
-  "intermediate_size": 3072,
-  "max_position_embeddings": 40960,
-  "model_type": "qwen3",
-  "num_attention_heads": 16,
-  "num_hidden_layers": 28,
-  "num_key_value_heads": 8,
-  "rms_norm_eps": 1e-06,
-  "rope_theta": 1000000,
-  "tie_word_embeddings": True,
-  "torch_dtype": "bfloat16",
-  "vocab_size": 151936
+    "architectures": [
+        "Qwen3ForCausalLM"
+    ],
+    "attention_bias": False,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "head_dim": 128,
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "max_position_embeddings": 40960,
+    "model_type": "qwen3",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 8,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000,
+    "tie_word_embeddings": True,
+    "torch_dtype": "bfloat16",
+    "vocab_size": 151936
 }
+
 
 def main():
     model = "Qwen/Qwen3-0.6B"

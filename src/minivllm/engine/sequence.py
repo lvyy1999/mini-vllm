@@ -1,7 +1,8 @@
+from copy import copy
 from enum import Enum, auto
 from itertools import count
+
 from minivllm.sampling_parameters import SamplingParams
-from copy import copy
 
 
 class SequenceStatus(Enum):
@@ -13,6 +14,7 @@ class SequenceStatus(Enum):
 class Sequence:
     counter = count()
     block_size = 256
+
     def __init__(
             self,
             token_ids: list[int],
@@ -20,23 +22,17 @@ class Sequence:
     ):
         # record sequence id
         self.seq_id = next(Sequence.counter)
-        # status
+        # sequence status
         self.status = SequenceStatus.WAITING
         # token ids, need copy so that it is a new list, won't be affected by outside changes
         self.token_ids = copy(token_ids)
-        # last token
+        # init needed params
         self.last_token = self.token_ids[-1] if self.token_ids else None
-        # num of all tokens
         self.num_tokens = len(self.token_ids)
-        # num of prompt tokens
         self.num_prompt_tokens = len(self.token_ids)
-        # num of tokens in cache
         self.num_cached_tokens = 0
-        # num of tokens scheduled in this turn
         self.num_scheduled_tokens = 0
-        # prefill or decode
-        self.is_prefill = True
-        # block table
+        self.is_prefill = True # prefill or decode
         self.block_table = []
         # sampling_params
         self.temperature = sampling_params.temperature

@@ -1,9 +1,8 @@
 import torch
 import time
-import triton 
-import triton.language as tl
 
 from minivllm.layers import flash_attention_decode
+
 
 def decode_torch_optimized(
     q: torch.Tensor,
@@ -140,6 +139,7 @@ def naive_decode_attention(
     
     return output
 
+
 def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size, device='cuda'):
     """Setup test data for benchmarking"""
     # Query: (batch_size, num_heads, head_dim)
@@ -168,7 +168,6 @@ def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, bloc
 def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8, 
                                   head_dim=128, block_size=16, num_iterations=100):
     """Compare all three implementations"""
-    
     print(f"\n{'='*70}")
     print(f"batch_size={batch_size}, seq_len={seq_len}, num_heads={num_heads}")
     print(f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, block_size={block_size}")
@@ -216,12 +215,12 @@ def benchmark(batch_size, seq_len, num_heads=32, num_kv_heads=8,
     # 3. Triton
     print("\n3. Testing Triton implementation...")
     for _ in range(10):  # warmup
-        _ = flash_attention_decode(q, k_cache, v_cache, scale, num_heads, num_kv_heads, head_dim, block_size, block_tables, context_lens)
+        _ = flash_attention_decode(q, k_cache, v_cache, scale, context_lens, block_tables)
     
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_iterations):
-        out_triton = flash_attention_decode(q, k_cache, v_cache, scale, num_heads, num_kv_heads, head_dim, block_size, block_tables, context_lens)
+        out_triton = flash_attention_decode(q, k_cache, v_cache, scale, context_lens, block_tables)
     torch.cuda.synchronize()
     triton_time = (time.perf_counter() - start) / num_iterations
     results['Triton'] = triton_time

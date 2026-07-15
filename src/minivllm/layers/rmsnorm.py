@@ -1,7 +1,9 @@
 import torch
 import time
 
+
 class RMSNorm(torch.nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
@@ -41,6 +43,7 @@ class RMSNorm(torch.nn.Module):
         else:
             return self.rms_forward(x)
 
+
 if __name__ == "__main__":
     # Example usage
     x = torch.randn(8,4000,8000).cuda()
@@ -73,4 +76,3 @@ if __name__ == "__main__":
         times.append(end_time - start_time)
     avg_time = sum(times) / len(times)
     print(f"[With residuals] Average inference time over 100 runs: {avg_time * 1000:.4f} ms")
-    

@@ -5,10 +5,10 @@ from collections import deque
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
 from minivllm.utils.config import Config
 from minivllm.engine.scheduler import Scheduler
 from minivllm.engine.sequence import Sequence, SequenceStatus
-
 
 
 def make_scheduler(
@@ -25,15 +25,18 @@ def make_scheduler(
     )
     return Scheduler(config)
 
+
 def inject_running(scheduler: Scheduler, *seqs: Sequence):
     """Put sequences directly into the running queue, bypassing prefill."""
     for seq in seqs:
         seq.status = SequenceStatus.RUNNING
         scheduler.running.append(seq)
 
+
 def all_tracked(scheduler: Scheduler, scheduled: list[Sequence]) -> set:
     """Return the set of all sequences the scheduler currently knows about."""
     return set(scheduler.running) | set(scheduler.waiting) | set(scheduled)
+
 
 class TestBug2TokenLimitBreak:
     """
@@ -143,6 +146,7 @@ class TestBug1CanAppendFailure:
 
 
 class TestSchedulerHappyPath:
+
     def test_prefill_scheduled_first(self):
         scheduler = make_scheduler(max_num_batched_tokens=100, max_cached_blocks=50)
         seq = Sequence([1, 2, 3, 4])

@@ -4,7 +4,9 @@ from collections import deque
 
 from minivllm.engine.sequence import Sequence
 
+
 class Block:
+
     def __init__(self, block_id):
         self.block_id = block_id
         self.hash = -1 
@@ -20,16 +22,9 @@ class Block:
         self.ref_count = 1
         self.token_ids = []
 
-# given token_ids, compute the hash value
-# use prefix_hash_value to compute the hash in a context-sensitive way
-def compute_hash(token_ids: list[int], prefix_hash_value: int) -> int:
-    h = xxhash.xxh64()
-    if prefix_hash_value != -1:
-        h.update(prefix_hash_value.to_bytes(8, 'little'), )
-    h.update(np.array(token_ids, dtype=np.int32).tobytes(), )
-    return h.intdigest()
 
 class BlockManager:
+
     def __init__(self, num_blocks: int, block_size: int):
         # number of tokens per block
         self.block_size = block_size
@@ -41,6 +36,16 @@ class BlockManager:
         self.free_block_ids = deque(range(num_blocks))
         # used block ids
         self.used_block_ids = set()
+
+    # given token_ids, compute the hash value
+    # use prefix_hash_value to compute the hash in a context-sensitive way
+    @classmethod
+    def compute_hash(cls, token_ids: list[int], prefix_hash_value: int) -> int:
+        h = xxhash.xxh64()
+        if prefix_hash_value != -1:
+            h.update(prefix_hash_value.to_bytes(8, 'little'), )
+        h.update(np.array(token_ids, dtype=np.int32).tobytes(), )
+        return h.intdigest()
 
     # allocate a free block, move it from free blocks to used blocks
     def _allocate_block(self) -> int:
@@ -76,7 +81,7 @@ class BlockManager:
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             # find in cache by prefix hash
-            h = compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             # maybe exist hash collision, so need to check token_ids
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
@@ -106,7 +111,7 @@ class BlockManager:
             if not cache_missed:
                 token_ids = seq.block(i)
                 # find in cache by prefix hash
-                h = compute_hash(token_ids, h)
+                h = self.compute_hash(token_ids, h)
                 block_id = self.hash_to_block_id.get(h, -1)
                 # maybe exist hash collision, so need to check token_ids
                 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
@@ -163,6 +168,6 @@ class BlockManager:
             block_id = seq.block_table[i]
             block = self.blocks[block_id]
             token_ids = seq.block(i)
-            h = compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block_id

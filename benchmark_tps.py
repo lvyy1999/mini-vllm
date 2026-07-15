@@ -1,15 +1,14 @@
 import time
 import torch
-
 from transformers import AutoTokenizer,AutoModelForCausalLM
-
-# ===== minivllm =====
-from minivllm.llm import LLM as MiniVLLM
-from minivllm.sampling_parameters import SamplingParams as MiniSamplingParams
 
 # ===== vllm =====
 from vllm import LLM as VLLM
 from vllm import SamplingParams as VLLMSamplingParams
+
+# ===== minivllm =====
+from minivllm.llm import LLM as MiniVLLM
+from minivllm.sampling_parameters import SamplingParams as MiniSamplingParams
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 MODEL_CONFIG = {
@@ -44,9 +43,11 @@ WARMUP_STEPS = 2
 OUTPUT_TOKENS = 256  # ouput token num
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
 def cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
 
 def run_minivllm(tokenizer):
     llm = MiniVLLM(
@@ -54,6 +55,7 @@ def run_minivllm(tokenizer):
         model_name_or_path=MODEL_NAME,
         custom_model_config=MODEL_CONFIG
     )
+
     sampling = MiniSamplingParams(
         temperature=0.6,
         max_tokens=OUTPUT_TOKENS,
@@ -187,7 +189,6 @@ def main():
         print(f"{k}:")
         for kk, vv in v.items():
             print(f"  {kk}: {vv:.4f}")
-
 
 
 if __name__ == "__main__":

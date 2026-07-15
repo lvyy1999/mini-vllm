@@ -5,7 +5,9 @@ import torch.distributed as dist
 
 from minivllm.utils import get_context
 
+
 class VocabParallelEmbedding(nn.Module):
+
     def __init__(
         self,
         vocab_size: int,
@@ -55,8 +57,10 @@ class VocabParallelEmbedding(nn.Module):
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         return output
 
+
 # weight tying with embedding layer
 class ParallelLMHead(VocabParallelEmbedding):
+
     def __init__(
         self,
         vocab_size: int,

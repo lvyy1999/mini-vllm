@@ -1,10 +1,12 @@
 from collections import deque
+
 from minivllm.engine.sequence import Sequence, SequenceStatus
 from minivllm.engine.block_manager import BlockManager
 from minivllm.utils.config import Config
 
 
 class Scheduler:
+
     def __init__(self, config: Config):
         self.eos = config.eos_token_id
         self.num_blocks = config.max_cache_blocks

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+
 class LinearBase(nn.Module):
     """
     A base class for linear layers.
@@ -38,30 +39,12 @@ class LinearBase(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-"""
-these functions are for is that we deploy a maybe randomly initialized model on GPU using some tensor/pipeline parallel method
-then we wanna load a saved model checkpoint to it
-
-for name, param in model.named_parameters():
-    if name in checkpoint:
-        loaded_weight = checkpoint[name]  # full model parameter (4096, 4096)
-        
-        # check if the parameter has a custom weight_loader
-        if hasattr(param, 'weight_loader'):
-            # call custom weight_loader
-            param.weight_loader(param, loaded_weight)
-            # weight_loader will automatically:
-            # 1. extract the shard corresponding to the current GPU
-            # 2. copy it to param.data
-        else:
-            # default: copy directly
-            param.data.copy_(loaded_weight)
-"""
 
 # the simplest Linear layer: ReplicatedLinear(LinearBase)
 # where we simply copy the weight as the weight_loader
 # and run the forward as a normal linear layer
 class ReplicatedLinear(LinearBase):
+
     def __init__(
         self, 
         input_size: int, 
@@ -76,12 +59,14 @@ class ReplicatedLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
+
 # column-split Linear layer: ColumnParallelLinear(LinearBase)
 # get the original full parameter
 # compute the starting index of the column split
 # compute the dim size of the full parameter
 # copy the parameter slice to the local parameter
 class ColumnParallelLinear(LinearBase):
+
     def __init__(
         self, 
         input_size: int, 
@@ -109,8 +94,10 @@ class ColumnParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
+
 # an extension of ColumnParallelLinear by merging several matrices
 class MergedColumnParallelLinear(ColumnParallelLinear):
+
     def __init__(
         self, 
         input_size: int, 
@@ -139,6 +126,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVColumnParallelLinear(ColumnParallelLinear):
+
     def __init__(
         self,
         hidden_size: int,
@@ -178,7 +166,9 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
         shard_weights = loaded_weights.narrow(0, start_index, shard_size)
         param_data.copy_(shard_weights)
 
+
 class RowParallelLinear(LinearBase):
+
     def __init__(
         self,
         input_size: int,
@@ -206,4 +196,3 @@ class RowParallelLinear(LinearBase):
         if self.tp_size > 1:
             dist.all_reduce(y, op=dist.ReduceOp.SUM)
         return y
-
