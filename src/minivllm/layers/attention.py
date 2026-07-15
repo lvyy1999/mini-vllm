@@ -193,7 +193,7 @@ def flash_attention_prefill_with_cache_kernel(
         alpha = tl.exp(m_i - m_new)
         p_ij = tl.exp(s_ij - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p_ij, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p_ij, v_j)
+        acc = acc * alpha[:, None] + tl.dot(p_ij.to(v_j.dtype), v_j)
         m_i = m_new
         l_i = l_new
     
@@ -282,7 +282,7 @@ def flash_attention_prefill_without_cache_kernel(
         alpha = tl.exp(m_i - m_new)
         p_ij = tl.exp(s_ij - m_new[:, None])
         l_new = l_i * alpha + tl.sum(p_ij, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p_ij, v_j)
+        acc = acc * alpha[:, None] + tl.dot(p_ij.to(v_j.dtype), v_j)
         m_i = m_new
         l_i = l_new
 
