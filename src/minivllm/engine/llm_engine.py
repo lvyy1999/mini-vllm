@@ -99,13 +99,13 @@ class LLMEngine:
             running_time = perf_counter() - t
             if is_prefill:
                 prefill_throughput = num_tokens / running_time
-                # print(num_tokens, ' tokens processed, ', prefill_throughput, " tokens/s during prefilling")
+                # print(num_tokens, ' tokens processed, ', prefill_throughput, " tok/s during prefilling")
             else:
                 decode_throughput = num_tokens / running_time
-                # print(num_tokens, ' tokens processed, ', decode_throughput, " tokens/s during decoding")
+                # print(num_tokens, ' tokens processed, ', decode_throughput, " tok/s during decoding")
             pbar.set_postfix({
-                "Prefill": f"{num_tokens if is_prefill else 0} tokens processed, {int(prefill_throughput)}tokens/s",
-                "Decode": f"{num_tokens if not is_prefill else 0} tokens processed, {int(decode_throughput)}tokens/s",
+                "Prefill": f"{num_tokens if is_prefill else 0} tokens processed, {int(prefill_throughput)}tok/s",
+                "Decode": f"{num_tokens if not is_prefill else 0} tokens processed, {int(decode_throughput)}tok/s",
             })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids

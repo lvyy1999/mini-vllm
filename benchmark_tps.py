@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import argparse
 import gc
 import time
 import torch
@@ -42,13 +43,37 @@ PROMPTS = [
 ]
 
 WARMUP_STEPS = 2
-OUTPUT_TOKENS = 256  # ouput token num
+OUTPUT_TOKENS = 256  # output token num
+REPEAT_STEPS = 1
+SEED = 0
+IGNORE_EOS = True
+TEMPERATURE = 0.6
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def summarize_measurements(measurements):
+    total_latency = sum(item["latency"] for item in measurements)
+    total_tokens = sum(item["tokens"] for item in measurements)
+    repeat = len(measurements)
+    return {
+        "total_latency": total_latency,
+        "total_tokens": total_tokens,
+        "avg_latency": total_latency / repeat,
+        "avg_tokens": total_tokens / repeat,
+        "tps": total_tokens / total_latency,
+        "repeat": repeat,
+    }
 
 
 def cleanup_cuda():
@@ -69,16 +94,18 @@ def build_chat_prompts(tokenizer):
     ]
 
 
-def run_minivllm(prompts):
+def run_minivllm(prompts, gpu_memory_utilization = 0.9):
     llm = MiniVLLM(
         enforce_eager=True,
+        gpu_memory_utilization=gpu_memory_utilization,
         model_name_or_path=MODEL_NAME,
         custom_model_config=MODEL_CONFIG
     )
 
     sampling = MiniSamplingParams(
-        temperature=0.6,
+        temperature=TEMPERATURE,
         max_tokens=OUTPUT_TOKENS,
+        ignore_eos=IGNORE_EOS,
     )
 
     # warmup
@@ -86,25 +113,30 @@ def run_minivllm(prompts):
         llm.generate(prompts, sampling)
         cuda_sync()
 
-    start = time.perf_counter()
-    outputs = llm.generate(prompts, sampling)
-    cuda_sync()
-    end = time.perf_counter()
+    measurements = []
+    outputs = None
+    for i in range(REPEAT_STEPS):
+        set_seed(SEED + i)
+        start = time.perf_counter()
+        outputs = llm.generate(prompts, sampling)
+        cuda_sync()
+        end = time.perf_counter()
 
-    total_tokens = sum(len(output['token_ids']) for output in outputs)
-    latency = end - start
+        total_tokens = sum(len(output['token_ids']) for output in outputs)
+        latency = end - start
+        measurements.append({
+            "latency": latency,
+            "tokens": total_tokens,
+            "tps": total_tokens / latency,
+        })
 
-    result = {
-        "latency": latency,
-        "tokens": total_tokens,
-        "tps": total_tokens / latency,
-    }
+    result = summarize_measurements(measurements)
     del llm, outputs
     cleanup_cuda()
     return result
 
 
-def run_vllm(tokenizer, prompts):
+def run_vllm(tokenizer, prompts, gpu_memory_utilization):
     try:
         from vllm import LLM as VLLM
         from vllm import SamplingParams as VLLMSamplingParams
@@ -119,14 +151,15 @@ def run_vllm(tokenizer, prompts):
         model=MODEL_NAME,
         tokenizer=MODEL_NAME,
         trust_remote_code=False,
-        gpu_memory_utilization=0.75,
+        gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         speculative_config=None,
     )
 
     sampling = VLLMSamplingParams(
-        temperature=0.6,
+        temperature=TEMPERATURE,
         max_tokens=OUTPUT_TOKENS,
+        ignore_eos=IGNORE_EOS,
     )
 
     # warmup
@@ -134,19 +167,24 @@ def run_vllm(tokenizer, prompts):
         llm.generate(prompts, sampling)
         cuda_sync()
 
-    start = time.perf_counter()
-    outputs = llm.generate(prompts, sampling)
-    cuda_sync()
-    end = time.perf_counter()
+    measurements = []
+    outputs = None
+    for i in range(REPEAT_STEPS):
+        set_seed(SEED + i)
+        start = time.perf_counter()
+        outputs = llm.generate(prompts, sampling)
+        cuda_sync()
+        end = time.perf_counter()
 
-    total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-    latency = end - start
+        total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        latency = end - start
+        measurements.append({
+            "latency": latency,
+            "tokens": total_tokens,
+            "tps": total_tokens / latency,
+        })
 
-    result = {
-        "latency": latency,
-        "tokens": total_tokens,
-        "tps": total_tokens / latency,
-    }
+    result = summarize_measurements(measurements)
     del llm, outputs
     cleanup_cuda()
     return result
@@ -155,67 +193,147 @@ def run_vllm(tokenizer, prompts):
 def run_transformers_test(tokenizer, prompts):
     # transformers
     inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to(device)
+    if IGNORE_EOS:
+        model.generation_config.eos_token_id = None
 
     # Prepare attention_mask explicitly
     attention_mask = inputs["attention_mask"]
 
     # warmup
+    generation_kwargs = dict(
+        attention_mask=attention_mask,
+        max_new_tokens=OUTPUT_TOKENS,
+        do_sample=True,
+        temperature=TEMPERATURE,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    if IGNORE_EOS:
+        generation_kwargs["eos_token_id"] = None
+
     for _ in range(WARMUP_STEPS):
         with torch.no_grad():
-            model.generate(inputs['input_ids'], attention_mask=attention_mask, max_new_tokens=OUTPUT_TOKENS)
+            model.generate(inputs['input_ids'], **generation_kwargs)
 
-    start = time.perf_counter()
-    with torch.no_grad():
-        outputs = model.generate(inputs['input_ids'], attention_mask=attention_mask, max_new_tokens=OUTPUT_TOKENS)
-    end = time.perf_counter()
+    input_length = inputs['input_ids'].shape[1]
+    measurements = []
+    outputs = None
+    for i in range(REPEAT_STEPS):
+        set_seed(SEED + i)
+        start = time.perf_counter()
+        with torch.no_grad():
+            outputs = model.generate(inputs['input_ids'], **generation_kwargs)
+        cuda_sync()
+        end = time.perf_counter()
 
-    input_lens = attention_mask.sum(dim=1).tolist()
-    total_tokens = sum(max(0, len(output) - int(input_len)) for output, input_len in zip(outputs, input_lens))
-    latency = end - start
+        total_tokens = sum(max(0, len(output) - input_length) for output in outputs)
+        latency = end - start
+        measurements.append({
+            "latency": latency,
+            "tokens": total_tokens,
+            "tps": total_tokens / latency,
+        })
 
-    tps = total_tokens / latency
-
-    result = {
-        "latency": latency,
-        "tokens": total_tokens,
-        "tps": tps,
-    }
+    result = summarize_measurements(measurements)
     del model, outputs
     cleanup_cuda()
     return result
 
 
+def print_results(results):
+    print("\n=== Benchmark Results ===")
+    for name, metrics in results.items():
+        print(f"{name}:")
+        for key, value in metrics.items():
+            if key in {"total_tokens", "repeat"} and isinstance(value, (int, float)):
+                print(f"  {key}: {int(round(value))}")
+            elif key == "avg_tokens" and isinstance(value, (int, float)):
+                print(f"  {key}: {value:.2f} tokens/run")
+            elif key in {"total_latency", "avg_latency"} and isinstance(value, (int, float)):
+                print(f"  {key}: {value:.4f} s")
+            elif key == "tps" and isinstance(value, (int, float)):
+                print(f"  {key}: {value:.4f} tokens/s")
+            elif isinstance(value, (int, float)):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark mini-vllm, vLLM, or transformers separately.")
+    parser.add_argument(
+        "--backend",
+        choices=["minivllm", "vllm", "transformers", "all"],
+        default="all",
+        help="Which backend to benchmark. Use one backend per Colab run on memory-limited GPUs.",
+    )
+    parser.add_argument(
+        "--output-tokens",
+        type=int,
+        default=OUTPUT_TOKENS,
+        help="Maximum number of new tokens to generate.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=WARMUP_STEPS,
+        help="Number of warmup generations before timing.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=REPEAT_STEPS,
+        help="Number of timed generations to average.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help="Base random seed used before each timed generation.",
+    )
+    parser.add_argument(
+        "--respect-eos",
+        action="store_true",
+        help="Stop at EOS instead of forcing each backend toward output-tokens tokens.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.75,
+        help="GPU memory utilization passed to vLLM.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    global OUTPUT_TOKENS, WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS
+    args = parse_args()
+    OUTPUT_TOKENS = args.output_tokens
+    WARMUP_STEPS = args.warmup_steps
+    REPEAT_STEPS = args.repeat
+    SEED = args.seed
+    IGNORE_EOS = not args.respect_eos
+    set_seed(SEED)
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, padding_side='left')
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     prompts = build_chat_prompts(tokenizer)
 
-    print("Running minivllm benchmark...")
-    mini = run_minivllm(prompts)
+    results = {}
 
-    print("Running vLLM benchmark...")
-    vllm = run_vllm(tokenizer, prompts)
+    if args.backend in ("minivllm", "all"):
+        print("Running minivllm benchmark...")
+        results["minivllm"] = run_minivllm(prompts, args.gpu_memory_utilization)
 
-    print("Running transformers benchmark...")
-    transformers = run_transformers_test(tokenizer, prompts)
+    if args.backend in ("vllm", "all"):
+        print("Running vLLM benchmark...")
+        results["vLLM"] = run_vllm(tokenizer, prompts, args.gpu_memory_utilization)
 
+    if args.backend in ("transformers", "all"):
+        print("Running transformers benchmark...")
+        results["transformers"] = run_transformers_test(tokenizer, prompts)
 
-    results = {
-        "minivllm": mini,
-        "vLLM": vllm,
-        "transformers":transformers
-    }
-
-    print("\n=== Benchmark Results ===")
-    for k, v in results.items():
-        print(f"{k}:")
-        for kk, vv in v.items():
-            if isinstance(vv, (int, float)):
-                print(f"  {kk}: {vv:.4f}")
-            else:
-                print(f"  {kk}: {vv}")
+    print_results(results)
 
 
 if __name__ == "__main__":
