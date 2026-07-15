@@ -1,10 +1,9 @@
 import sys
-from pathlib import Path
 import time
+from pathlib import Path
 
 import torch
 
-# Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from minivllm.layers import flash_attention_decode
@@ -16,13 +15,16 @@ def report_correctness(
     candidate: torch.Tensor,
     atol: float = 2e-2,
     rtol: float = 2e-2,
+    reference_name: str = "CPU PyTorch",
 ) -> bool:
     reference_cpu = reference.detach().to(device="cpu", dtype=torch.float32)
     candidate_cpu = candidate.detach().to(device="cpu", dtype=torch.float32)
     max_abs_err = (reference_cpu - candidate_cpu).abs().max().item()
     is_close = torch.allclose(reference_cpu, candidate_cpu, atol=atol, rtol=rtol)
     status = "PASS" if is_close else "FAIL"
-    print(f"   Correctness vs CPU PyTorch [{name}]: {status}, max_abs_err={max_abs_err:.6f}")
+    print(
+        f"   Correctness vs {reference_name} [{name}]: {status}, max_abs_err={max_abs_err:.6f}"
+    )
     return is_close
 
 
@@ -32,6 +34,8 @@ def decode_pytorch_attention(
     v_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    context_lens_host: list[int],
+    max_context_len: int,
     scale: float,
     num_heads: int,
     num_kv_heads: int,
@@ -42,27 +46,28 @@ def decode_pytorch_attention(
     batch_size = q.shape[0]
     device = q.device
     dtype = q.dtype
-    max_context_len = context_lens.max().item()
 
     padded_k = torch.zeros(
-        batch_size, max_context_len, num_kv_heads, head_dim,
-        device=device, dtype=dtype,
+        batch_size,
+        max_context_len,
+        num_kv_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
     )
     padded_v = torch.zeros_like(padded_k)
 
-    for i in range(batch_size):
-        seq_len = context_lens[i].item()
+    for i, seq_len in enumerate(context_lens_host):
         num_blocks_needed = (seq_len + block_size - 1) // block_size
         valid_blocks = block_tables[i, :num_blocks_needed]
-        valid_blocks = valid_blocks[valid_blocks != -1]
 
-        if len(valid_blocks) > 0:
-            gathered_k = k_cache[valid_blocks].reshape(
-                -1, num_kv_heads, head_dim
-            )[:seq_len]
-            gathered_v = v_cache[valid_blocks].reshape(
-                -1, num_kv_heads, head_dim
-            )[:seq_len]
+        if num_blocks_needed > 0:
+            gathered_k = k_cache[valid_blocks].reshape(-1, num_kv_heads, head_dim)[
+                :seq_len
+            ]
+            gathered_v = v_cache[valid_blocks].reshape(-1, num_kv_heads, head_dim)[
+                :seq_len
+            ]
             padded_k[i, :seq_len] = gathered_k
             padded_v[i, :seq_len] = gathered_v
 
@@ -77,9 +82,7 @@ def decode_pytorch_attention(
 
     attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
     mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
-    attn_scores = attn_scores.masked_fill(
-        ~mask[:, None, None, :], float("-inf")
-    )
+    attn_scores = attn_scores.masked_fill(~mask[:, None, None, :], float("-inf"))
     attn_probs = torch.softmax(attn_scores, dim=-1)
     return torch.matmul(attn_probs, padded_v).squeeze(2)
 
@@ -104,12 +107,20 @@ def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, bloc
     block_tables_gpu = block_tables_cpu.to(device="cuda")
     context_lens_gpu = context_lens_cpu.to(device="cuda")
 
-    scale = 1.0 / (head_dim ** 0.5)
+    scale = 1.0 / (head_dim**0.5)
     cpu_inputs = (
-        q_cpu, k_cache_cpu, v_cache_cpu, block_tables_cpu, context_lens_cpu,
+        q_cpu,
+        k_cache_cpu,
+        v_cache_cpu,
+        block_tables_cpu,
+        context_lens_cpu,
     )
     gpu_inputs = (
-        q_gpu, k_cache_gpu, v_cache_gpu, block_tables_gpu, context_lens_gpu,
+        q_gpu,
+        k_cache_gpu,
+        v_cache_gpu,
+        block_tables_gpu,
+        context_lens_gpu,
     )
     return cpu_inputs, gpu_inputs, scale
 
@@ -139,20 +150,42 @@ def benchmark(
     )
     q_cpu, k_cpu, v_cpu, blocks_cpu, lens_cpu = cpu_inputs
     q_gpu, k_gpu, v_gpu, blocks_gpu, lens_gpu = gpu_inputs
+    context_lens_host = lens_cpu.tolist()
+    max_context_len = max(context_lens_host)
     cpu_iters = cpu_iteration_count(batch_size, seq_len, num_iterations)
     results = {}
 
     print(f"\n[1/3] CPU PyTorch baseline (FP32, {cpu_iters} iterations)...")
     for _ in range(2):
         _ = decode_pytorch_attention(
-            q_cpu, k_cpu, v_cpu, blocks_cpu, lens_cpu, scale,
-            num_heads, num_kv_heads, head_dim, block_size,
+            q_cpu,
+            k_cpu,
+            v_cpu,
+            blocks_cpu,
+            lens_cpu,
+            context_lens_host,
+            max_context_len,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
         )
     start = time.perf_counter()
     for _ in range(cpu_iters):
         out_cpu = decode_pytorch_attention(
-            q_cpu, k_cpu, v_cpu, blocks_cpu, lens_cpu, scale,
-            num_heads, num_kv_heads, head_dim, block_size,
+            q_cpu,
+            k_cpu,
+            v_cpu,
+            blocks_cpu,
+            lens_cpu,
+            context_lens_host,
+            max_context_len,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
         )
     cpu_time = (time.perf_counter() - start) / cpu_iters
     results["CPU PyTorch FP32"] = cpu_time
@@ -161,15 +194,35 @@ def benchmark(
     print(f"\n[2/3] GPU PyTorch baseline (FP16, {num_iterations} iterations)...")
     for _ in range(10):
         _ = decode_pytorch_attention(
-            q_gpu, k_gpu, v_gpu, blocks_gpu, lens_gpu, scale,
-            num_heads, num_kv_heads, head_dim, block_size,
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            blocks_gpu,
+            lens_gpu,
+            context_lens_host,
+            max_context_len,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
         )
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_iterations):
         out_gpu = decode_pytorch_attention(
-            q_gpu, k_gpu, v_gpu, blocks_gpu, lens_gpu, scale,
-            num_heads, num_kv_heads, head_dim, block_size,
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            blocks_gpu,
+            lens_gpu,
+            context_lens_host,
+            max_context_len,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
         )
     torch.cuda.synchronize()
     gpu_time = (time.perf_counter() - start) / num_iterations
@@ -191,6 +244,12 @@ def benchmark(
     results["GPU Triton FP16"] = triton_time
     print(f"   Time: {triton_time * 1000:.3f} ms")
     report_correctness("GPU Triton FP16", out_cpu, out_triton)
+    report_correctness(
+        "GPU Triton FP16",
+        out_gpu,
+        out_triton,
+        reference_name="GPU PyTorch FP16",
+    )
 
     print("\n   Speedups:")
     print(f"   GPU PyTorch vs CPU PyTorch: {cpu_time / gpu_time:.2f}x")

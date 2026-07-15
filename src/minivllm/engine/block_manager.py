@@ -1,6 +1,7 @@
-import xxhash
-import numpy as np
 from collections import deque
+
+import numpy as np
+import xxhash
 
 from minivllm.engine.sequence import Sequence
 
@@ -9,7 +10,7 @@ class Block:
 
     def __init__(self, block_id):
         self.block_id = block_id
-        self.hash = -1 
+        self.hash = -1
         self.ref_count = 0
         self.token_ids = []
 
@@ -18,7 +19,7 @@ class Block:
         self.token_ids = token_ids
 
     def reset(self):
-        self.hash = -1 
+        self.hash = -1
         self.ref_count = 1
         self.token_ids = []
 
@@ -43,8 +44,12 @@ class BlockManager:
     def compute_hash(cls, token_ids: list[int], prefix_hash_value: int) -> int:
         h = xxhash.xxh64()
         if prefix_hash_value != -1:
-            h.update(prefix_hash_value.to_bytes(8, 'little'), )
-        h.update(np.array(token_ids, dtype=np.int32).tobytes(), )
+            h.update(
+                prefix_hash_value.to_bytes(8, "little"),
+            )
+        h.update(
+            np.array(token_ids, dtype=np.int32).tobytes(),
+        )
         return h.intdigest()
 
     # allocate a free block, move it from free blocks to used blocks
@@ -85,7 +90,7 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             # maybe exist hash collision, so need to check token_ids
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break # prefix cache missed
+                break  # prefix cache missed
             # cache hit a block
             num_blocks_find_in_cache += 1
             # cache hit and the block is in use, needn't allocate
@@ -98,9 +103,11 @@ class BlockManager:
         # if free blocks enough to allocate, return the number of cached tokens,
         # where num_cached_tokens = num_blocks_find_in_cache * self.block_size;
         # otherwise, return -1
-        return num_blocks_find_in_cache * self.block_size \
-            if len(self.free_block_ids) >= num_blocks_need_allocate \
+        return (
+            num_blocks_find_in_cache * self.block_size
+            if len(self.free_block_ids) >= num_blocks_need_allocate
             else -1
+        )
 
     def allocate(self, seq: Sequence) -> None:
         assert not seq.block_table, "The sequence is already allocated"
@@ -128,11 +135,11 @@ class BlockManager:
                         self.used_block_ids.add(block_id)
                         self.free_block_ids.remove(block_id)
                     seq.block_table.append(block_id)
-            if cache_missed: # cache missed, need to allocate a new block
+            if cache_missed:  # cache missed, need to allocate a new block
                 seq.block_table.append(self._allocate_block())
         # calculate the number of cached tokens
         seq.num_cached_tokens = num_cached_blocks * self.block_size
-        
+
     def deallocate(self, seq: Sequence) -> None:
         # update block information; later allocate, earlier deallocate
         for block_id in reversed(seq.block_table):
@@ -159,7 +166,7 @@ class BlockManager:
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
         if start == end:
-            return # no new full blocks need to calculate hash
+            return  # no new full blocks need to calculate hash
         # get prefix hash before the start block
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         # update the prefix hash value of new full blocks and prefix hash map,

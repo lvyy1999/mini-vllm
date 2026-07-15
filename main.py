@@ -1,7 +1,8 @@
 import os
 import sys
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -10,9 +11,7 @@ from minivllm import LLM, SamplingParams
 
 # config of used custom model
 model_config = {
-    "architectures": [
-        "Qwen3ForCausalLM"
-    ],
+    "architectures": ["Qwen3ForCausalLM"],
     "attention_bias": False,
     "bos_token_id": 151643,
     "eos_token_id": 151645,
@@ -27,8 +26,8 @@ model_config = {
     "rms_norm_eps": 1e-06,
     "rope_theta": 1000000,
     "tie_word_embeddings": True,
-    "torch_dtype": "float16", # Tesla T4 not support bfloat16, change to float16
-    "vocab_size": 151936
+    "torch_dtype": "float16",  # Tesla T4 not support bfloat16, change to float16
+    "vocab_size": 151936,
 }
 
 
@@ -37,17 +36,15 @@ def main():
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=path)
     llm = LLM(
-        enforce_eager=True,
-        model_name_or_path=model,
-        custom_model_config=model_config
+        enforce_eager=True, model_name_or_path=model, custom_model_config=model_config
     )
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
-        "introduce yourself",# * 15,
-        "list all prime numbers within 100",# * 15,
-        "give me your opinion on the impact of artificial intelligence on society",# * 15,
-    ] # * 30
+        "introduce yourself",  # * 15,
+        "list all prime numbers within 100",  # * 15,
+        "give me your opinion on the impact of artificial intelligence on society",  # * 15,
+    ]  # * 30
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

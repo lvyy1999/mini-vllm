@@ -1,14 +1,12 @@
 import os
 import sys
-import pytest
-from collections import deque
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from minivllm.utils.config import Config
 from minivllm.engine.scheduler import Scheduler
 from minivllm.engine.sequence import Sequence, SequenceStatus
+from minivllm.utils.config import Config
 
 
 def make_scheduler(

@@ -1,18 +1,14 @@
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from minivllm.utils import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
 
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int
-    ):
+    def __init__(self, vocab_size: int, hidden_size: int):
         super().__init__()
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -22,7 +18,9 @@ class VocabParallelEmbedding(nn.Module):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         # pad to make it divisible by tp_size
-        self.padded_vocab_size = (vocab_size + self.tp_size - 1) // self.tp_size * self.tp_size
+        self.padded_vocab_size = (
+            (vocab_size + self.tp_size - 1) // self.tp_size * self.tp_size
+        )
         # this is the vocab_size of per partition in this current GPU
         self.shard_vocab_size = self.padded_vocab_size // self.tp_size
 
@@ -45,9 +43,11 @@ class VocabParallelEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # mask for tokens in this partition's range and within original vocab size
-        mask = (x >= self.tp_rank * self.shard_vocab_size) & \
-               (x < (self.tp_rank + 1) * self.shard_vocab_size) & \
-               (x < self.vocab_size)
+        mask = (
+            (x >= self.tp_rank * self.shard_vocab_size)
+            & (x < (self.tp_rank + 1) * self.shard_vocab_size)
+            & (x < self.vocab_size)
+        )
         x = mask * (x - self.tp_rank * self.shard_vocab_size)
         output = F.embedding(x, self.weight)
 
@@ -61,11 +61,7 @@ class VocabParallelEmbedding(nn.Module):
 # weight tying with embedding layer
 class ParallelLMHead(VocabParallelEmbedding):
 
-    def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int
-    ):
+    def __init__(self, vocab_size: int, hidden_size: int):
         super().__init__(vocab_size, hidden_size)
 
     # x: [batch_size, seq_len, hidden_size]
@@ -75,7 +71,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         if context.is_prefill:
             # cu_seqlens_q = [0, 5, 8, 12]
             # last_indices = [5, 8, 12] - 1 = [4, 7, 11]
-            last_token = context.cu_seqlens_q[1:] - 1  # exclude the first element which is 0
+            last_token = (
+                context.cu_seqlens_q[1:] - 1
+            )  # exclude the first element which is 0
             x = x[last_token].contiguous()
 
         # logits: [batch_size, seq_len, shard_vocab_size]
@@ -83,10 +81,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             # prepare for all_gather only for GPU 0 which is the main GPU
-            all_logits = [
-                torch.empty_like(logits)
-                for _ in range(self.tp_size)
-            ] if self.tp_rank == 0 else None
+            all_logits = (
+                [torch.empty_like(logits) for _ in range(self.tp_size)]
+                if self.tp_rank == 0
+                else None
+            )
             # dist.gather collects the logits from all GPUs to GPU 0
             dist.gather(logits, gather_list=all_logits, dst=0)
             # concatenate
@@ -94,6 +93,6 @@ class ParallelLMHead(VocabParallelEmbedding):
                 # [batch_size, seq_len, padded_vocab_size]
                 logits = torch.cat(all_logits, dim=-1)
                 # trim to original vocab size
-                logits = logits[..., :self.vocab_size]
+                logits = logits[..., : self.vocab_size]
 
         return logits

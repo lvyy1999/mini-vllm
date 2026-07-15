@@ -23,4 +23,7 @@ class Config:
         assert 1 <= self.world_size <= 8
         assert self.cache_block_size % 256 == 0
         if "max_position_embeddings" in self.custom_model_config:
-            self.max_model_length = min(self.max_model_length, self.custom_model_config["max_position_embeddings"])
+            self.max_model_length = min(
+                self.max_model_length,
+                self.custom_model_config["max_position_embeddings"],
+            )

@@ -1,16 +1,17 @@
 import atexit
-import torch.multiprocessing as mp
-from typing import Any
-from tqdm.auto import tqdm
-from time import perf_counter
 from dataclasses import fields
+from time import perf_counter
+from typing import Any
+
+import torch.multiprocessing as mp
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from minivllm.utils.config import Config
-from minivllm.engine.sequence import Sequence
-from minivllm.engine.scheduler import Scheduler
 from minivllm.engine.model_runner import ModelRunner
+from minivllm.engine.scheduler import Scheduler
+from minivllm.engine.sequence import Sequence
 from minivllm.sampling_parameters import SamplingParams
+from minivllm.utils.config import Config
 
 
 def run_worker(config, rank, event):
@@ -62,14 +63,20 @@ class LLMEngine:
         # call scheduler to do post-process
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         # if seq is finished, add it into output
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
+        ]
         return outputs, num_tokens, is_prefill
 
     # add prompt to the waiting queue by first transforming it to Sequence object
-    def add_prompt(self, prompt: str | list[int], sampling_params: SamplingParams) -> None:
-        if isinstance(prompt, str): # if prompt is a string, tokenize it
+    def add_prompt(
+        self, prompt: str | list[int], sampling_params: SamplingParams
+    ) -> None:
+        if isinstance(prompt, str):  # if prompt is a string, tokenize it
             prompt = self.tokenizer.encode(prompt)
-        self.scheduler.add_sequence(Sequence(token_ids=prompt, sampling_params=sampling_params))
+        self.scheduler.add_sequence(
+            Sequence(token_ids=prompt, sampling_params=sampling_params)
+        )
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
@@ -79,20 +86,25 @@ class LLMEngine:
     # call step until all sequences are finished
     # return the generated texts
     def generate(
-            self,
-            prompts: list[str] | list[list[int]],
-            sampling_params: SamplingParams | list[SamplingParams],
-            use_tqdm: bool = True,
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
     ) -> list[dict[str, Any]]:
         # create tqdm bar
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        pbar = tqdm(
+            total=len(prompts),
+            desc="Generating",
+            dynamic_ncols=True,
+            disable=not use_tqdm,
+        )
         # add prompts
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_prompt(prompt, sp)
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens, is_prefill = self.step()
@@ -103,14 +115,19 @@ class LLMEngine:
             else:
                 decode_throughput = num_tokens / running_time
                 # print(num_tokens, ' tokens processed, ', decode_throughput, " tok/s during decoding")
-            pbar.set_postfix({
-                "Prefill": f"{num_tokens if is_prefill else 0} tokens processed, {int(prefill_throughput)}tok/s",
-                "Decode": f"{num_tokens if not is_prefill else 0} tokens processed, {int(decode_throughput)}tok/s",
-            })
+            pbar.set_postfix(
+                {
+                    "Prefill": f"{num_tokens if is_prefill else 0} tokens processed, {int(prefill_throughput)}tok/s",
+                    "Decode": f"{num_tokens if not is_prefill else 0} tokens processed, {int(decode_throughput)}tok/s",
+                }
+            )
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [
+            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
+            for token_ids in outputs
+        ]
         return outputs

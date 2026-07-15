@@ -1,10 +1,9 @@
 import sys
-from pathlib import Path
 import time
+from pathlib import Path
 
 import torch
 
-# Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from minivllm.layers import flash_attention_prefill
@@ -16,13 +15,16 @@ def report_correctness(
     candidate: torch.Tensor,
     atol: float = 2e-2,
     rtol: float = 2e-2,
+    reference_name: str = "CPU PyTorch",
 ) -> bool:
     reference_cpu = reference.detach().to(device="cpu", dtype=torch.float32)
     candidate_cpu = candidate.detach().to(device="cpu", dtype=torch.float32)
     max_abs_err = (reference_cpu - candidate_cpu).abs().max().item()
     is_close = torch.allclose(reference_cpu, candidate_cpu, atol=atol, rtol=rtol)
     status = "PASS" if is_close else "FAIL"
-    print(f"      Correctness vs CPU PyTorch [{name}]: {status}, max_abs_err={max_abs_err:.6f}")
+    print(
+        f"      Correctness vs {reference_name} [{name}]: {status}, max_abs_err={max_abs_err:.6f}"
+    )
     return is_close
 
 
@@ -83,7 +85,7 @@ def setup_data(num_seqs, seq_len, num_heads, num_kv_heads, head_dim):
     v_gpu = v_cpu.to(device="cuda", dtype=torch.float16)
     cu_seqlens_gpu = cu_seqlens_cpu.to(device="cuda")
 
-    scale = 1.0 / (head_dim ** 0.5)
+    scale = 1.0 / (head_dim**0.5)
     cpu_inputs = (q_cpu, k_cpu, v_cpu, cu_seqlens_cpu)
     gpu_inputs = (q_gpu, k_gpu, v_gpu, cu_seqlens_gpu)
     return cpu_inputs, gpu_inputs, scale
@@ -97,9 +99,13 @@ def cpu_iteration_count(seq_len: int, requested: int) -> int:
     return 1
 
 
-def benchmark(num_seqs, seq_len, num_heads=32, num_kv_heads=8, head_dim=128, num_iter=50):
+def benchmark(
+    num_seqs, seq_len, num_heads=32, num_kv_heads=8, head_dim=128, num_iter=50
+):
     print(f"\n{'=' * 80}")
-    print(f"Benchmark: {num_seqs} seqs x {seq_len} tokens (total: {num_seqs * seq_len} tokens)")
+    print(
+        f"Benchmark: {num_seqs} seqs x {seq_len} tokens (total: {num_seqs * seq_len} tokens)"
+    )
     print(f"Heads: {num_heads}/{num_kv_heads}, Dim: {head_dim}")
     print(f"{'=' * 80}")
 
@@ -114,14 +120,26 @@ def benchmark(num_seqs, seq_len, num_heads=32, num_kv_heads=8, head_dim=128, num
     print(f"\n[1/3] CPU PyTorch baseline (FP32, {cpu_iters} iterations)...")
     if seq_len <= 1024:
         _ = pytorch_standard_attention(
-            q_cpu, k_cpu, v_cpu, cu_seqlens_cpu, scale,
-            num_heads, num_kv_heads, head_dim,
+            q_cpu,
+            k_cpu,
+            v_cpu,
+            cu_seqlens_cpu,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
         )
     start = time.perf_counter()
     for _ in range(cpu_iters):
         out_cpu = pytorch_standard_attention(
-            q_cpu, k_cpu, v_cpu, cu_seqlens_cpu, scale,
-            num_heads, num_kv_heads, head_dim,
+            q_cpu,
+            k_cpu,
+            v_cpu,
+            cu_seqlens_cpu,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
         )
     cpu_time = (time.perf_counter() - start) / cpu_iters
     results["CPU PyTorch FP32"] = cpu_time
@@ -130,15 +148,27 @@ def benchmark(num_seqs, seq_len, num_heads=32, num_kv_heads=8, head_dim=128, num
     print(f"\n[2/3] GPU PyTorch baseline (FP16, {num_iter} iterations)...")
     for _ in range(5):
         _ = pytorch_standard_attention(
-            q_gpu, k_gpu, v_gpu, cu_seqlens_cpu, scale,
-            num_heads, num_kv_heads, head_dim,
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            cu_seqlens_cpu,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
         )
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_iter):
         out_gpu = pytorch_standard_attention(
-            q_gpu, k_gpu, v_gpu, cu_seqlens_cpu, scale,
-            num_heads, num_kv_heads, head_dim,
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            cu_seqlens_cpu,
+            scale,
+            num_heads,
+            num_kv_heads,
+            head_dim,
         )
     torch.cuda.synchronize()
     gpu_time = (time.perf_counter() - start) / num_iter
@@ -148,18 +178,36 @@ def benchmark(num_seqs, seq_len, num_heads=32, num_kv_heads=8, head_dim=128, num
 
     print(f"\n[3/3] GPU Triton Flash Attention (FP16, {num_iter} iterations)...")
     for _ in range(5):
-        _ = flash_attention_prefill(q_gpu, k_gpu, v_gpu, scale, cu_seqlens_gpu)
+        _ = flash_attention_prefill(
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            scale,
+            cu_seqlens_gpu,
+            max_seqlen_q=seq_len,
+        )
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_iter):
         out_triton = flash_attention_prefill(
-            q_gpu, k_gpu, v_gpu, scale, cu_seqlens_gpu
+            q_gpu,
+            k_gpu,
+            v_gpu,
+            scale,
+            cu_seqlens_gpu,
+            max_seqlen_q=seq_len,
         )
     torch.cuda.synchronize()
     triton_time = (time.perf_counter() - start) / num_iter
     results["GPU Triton FP16"] = triton_time
     print(f"      Time: {triton_time * 1000:.3f} ms")
     report_correctness("GPU Triton FP16", out_cpu, out_triton)
+    report_correctness(
+        "GPU Triton FP16",
+        out_gpu,
+        out_triton,
+        reference_name="GPU PyTorch FP16",
+    )
 
     print("\n      Speedups:")
     print(f"      GPU PyTorch vs CPU PyTorch: {cpu_time / gpu_time:.2f}x")

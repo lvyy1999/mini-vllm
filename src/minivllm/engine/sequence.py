@@ -15,11 +15,7 @@ class Sequence:
     counter = count()
     block_size = 256
 
-    def __init__(
-            self,
-            token_ids: list[int],
-            sampling_params = SamplingParams()
-    ):
+    def __init__(self, token_ids: list[int], sampling_params=SamplingParams()):
         # record sequence id
         self.seq_id = next(Sequence.counter)
         # sequence status
@@ -32,7 +28,7 @@ class Sequence:
         self.num_prompt_tokens = len(self.token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
-        self.is_prefill = True # prefill or decode
+        self.is_prefill = True  # prefill or decode
         self.block_table = []
         # sampling_params
         self.temperature = sampling_params.temperature
@@ -55,11 +51,11 @@ class Sequence:
 
     @property
     def prompt_token_ids(self):
-        return self.token_ids[:self.num_prompt_tokens]
+        return self.token_ids[: self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
-        return self.token_ids[self.num_prompt_tokens:]
+        return self.token_ids[self.num_prompt_tokens :]
 
     @property
     def num_blocks(self):
@@ -70,28 +66,30 @@ class Sequence:
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
-        assert 0 <= i < self.num_blocks, f"Block index {i} out of range [0, {self.num_blocks})"
-        if i == self.num_blocks - 1: # the last block maybe not full
-            return self.token_ids[-self.last_block_num_tokens:]
+        assert (
+            0 <= i < self.num_blocks
+        ), f"Block index {i} out of range [0, {self.num_blocks})"
+        if i == self.num_blocks - 1:  # the last block maybe not full
+            return self.token_ids[-self.last_block_num_tokens :]
         else:
             start_idx = i * self.block_size
             end_idx = start_idx + self.block_size
-            return self.token_ids[start_idx : end_idx]
+            return self.token_ids[start_idx:end_idx]
 
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_tokens += 1 
+        self.num_tokens += 1
 
     def __getstate__(self):
         return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
+            self.num_tokens,
+            self.num_prompt_tokens,
             self.num_cached_tokens,
             self.num_scheduled_tokens,
             self.block_table,
             self.block_size,
-            self.token_ids if self.is_prefill else self.last_token
+            self.token_ids if self.is_prefill else self.last_token,
         )
 
     def __setstate__(self, state):
@@ -102,7 +100,7 @@ class Sequence:
             self.num_scheduled_tokens,
             self.block_table,
             self.block_size,
-            last_token_or_ids
+            last_token_or_ids,
         ) = state
         if isinstance(last_token_or_ids, list):
             # Prefill: last_token_or_ids is the full token_ids list
