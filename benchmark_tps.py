@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 import time
 import torch
 from transformers import AutoTokenizer,AutoModelForCausalLM
@@ -5,6 +7,9 @@ from transformers import AutoTokenizer,AutoModelForCausalLM
 # ===== vllm =====
 from vllm import LLM as VLLM
 from vllm import SamplingParams as VLLMSamplingParams
+
+# Add src to Python path
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 # ===== minivllm =====
 from minivllm.llm import LLM as MiniVLLM

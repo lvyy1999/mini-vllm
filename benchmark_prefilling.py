@@ -1,7 +1,12 @@
+import sys
+from pathlib import Path
 import torch
 import time
 import triton
 import triton.language as tl
+
+# Add src to Python path
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from minivllm.layers import flash_attention_prefill
 
