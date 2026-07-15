@@ -14,6 +14,12 @@ from minivllm.utils.context import *
 from minivllm.utils.loader import load_weights_from_checkpoint
 from minivllm.utils.config import Config
 
+dtype_mapping = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
 
 class ModelRunner:
 
@@ -27,16 +33,18 @@ class ModelRunner:
         self.world_size = config.world_size
         self.block_size = config.cache_block_size
         self.enforce_eager = config.enforce_eager
-        self.default_dtype = torch.get_default_dtype()
 
         # set dist
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
 
-        # set default device to make the followed works on gpu
+        # set default device and dtype for model
+        self.model_dtype = dtype_mapping[config.custom_model_config.get('torch_dtype', 'float16')]
+        default_dtype = torch.get_default_dtype()
         torch.set_default_device(f'cuda:{rank}')
+        torch.set_default_dtype(self.model_dtype)
 
-        # set model
+        # create model
         model_name = Path(config.model_name_or_path).name
         match model_name:
             case 'Qwen3-0.6B':
@@ -82,7 +90,6 @@ class ModelRunner:
                 raise Exception(f"Unsupported model: {config.model_name_or_path}")
         # load pretrained model weights
         load_weights_from_checkpoint(self.model, config.model_name_or_path)
-
         # set sampler
         self.sampler = SamplerLayer()
         # warm up model so that we know peak memory usage
@@ -93,8 +100,9 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
 
-        # reset default device
+        # reset default device and dtype
         torch.set_default_device('cpu')
+        torch.set_default_dtype(default_dtype)
 
         # init shared memory
         if self.world_size > 1:
@@ -202,7 +210,7 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # calculate the actual bytes required of each block
-        block_bytes = 2 * self.num_layers * self.block_size * self.num_kv_heads * self.head_dim * self.default_dtype.itemsize
+        block_bytes = 2 * self.num_layers * self.block_size * self.num_kv_heads * self.head_dim * self.model_dtype.itemsize
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
@@ -236,7 +244,7 @@ class ModelRunner:
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        kv_cache = torch.zeros(2, self.num_layers, self.config.max_cache_blocks, self.block_size, self.num_kv_heads, self.head_dim, device=f'cuda:{self.rank}')
+        kv_cache = torch.zeros(2, self.num_layers, self.config.max_cache_blocks, self.block_size, self.num_kv_heads, self.head_dim, dtype=self.model_dtype, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -423,7 +431,7 @@ class ModelRunner:
         # where to read KV values in the cache
         block_tables = torch.zeros(self.max_graph_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
         # output logits
-        outputs = torch.zeros(self.max_graph_bs, self.hidden_size, device=f'cuda:{self.rank}')
+        outputs = torch.zeros(self.max_graph_bs, self.hidden_size, dtype=self.model_dtype, device=f'cuda:{self.rank}')
         # graphs to be captured for different batch sizes
         batch_sizes = [1, 2, 4, 8] + list(range(16, self.max_graph_bs + 1, 16))
         graph_pool = None

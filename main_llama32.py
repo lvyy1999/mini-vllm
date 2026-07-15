@@ -43,7 +43,7 @@ model_config = {
     },
     "rope_theta": 500000.0,
     "tie_word_embeddings": True,
-    "torch_dtype": "bfloat16",
+    "torch_dtype": "float16", # Tesla T4 not support bfloat16, change to float16
     "transformers_version": "4.45.0.dev0",
     "use_cache": True,
     "vocab_size": 128256

@@ -27,7 +27,7 @@ model_config = {
     "rms_norm_eps": 1e-06,
     "rope_theta": 1000000,
     "tie_word_embeddings": True,
-    "torch_dtype": "bfloat16",
+    "torch_dtype": "float16", # Tesla T4 not support bfloat16, change to float16
     "vocab_size": 151936
 }
 
