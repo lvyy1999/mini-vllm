@@ -49,7 +49,7 @@ class ModelRunner:
             config.model_name_or_path, config.custom_model_config
         )
         self.num_layers = info.num_layers
-        self.num_kv_heads = info.num_kv_heads
+        self.num_kv_heads = info.num_kv_heads // self.world_size  # split kv cache to multi gpu if needed
         self.head_dim = info.head_dim
         self.hidden_size = info.hidden_size
         # load pretrained model weights
@@ -178,13 +178,11 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # calculate the actual bytes required of each block
-        # for multi gpu, each gpu only need store a part of kv heads
-        num_kv_heads = self.num_kv_heads // self.world_size
         block_bytes = (
             2
             * self.num_layers
             * self.block_size
-            * num_kv_heads
+            * self.num_kv_heads
             * self.head_dim
             * self.model_dtype.itemsize
         )

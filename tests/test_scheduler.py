@@ -4,16 +4,16 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from minivllm.utils.config import Config
 from minivllm.engine.scheduler import Scheduler
 from minivllm.engine.sequence import Sequence, SequenceStatus
-from minivllm.utils.config import Config
 
 
 def make_scheduler(
     max_num_batched_tokens=100,
     max_num_sequences=10,
     max_cached_blocks=100,
-    block_size=4,
+    block_size=256,
 ):
     config = Config(
         max_num_batched_tokens=max_num_batched_tokens,

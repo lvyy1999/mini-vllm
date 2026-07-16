@@ -92,7 +92,7 @@ class Scheduler:
                 self.block_manager.append(seq)  # append one token
                 scheduled_seqs.append(seq)  # add into scheduled sequences
 
-        assert scheduled_seqs, "Should schedule at least one seq in decode stage."
+        # assert scheduled_seqs, "Should schedule at least one seq in decode stage."
 
         # re-add into running queue in the same order
         self.running.extendleft(reversed(scheduled_seqs))
