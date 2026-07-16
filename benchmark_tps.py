@@ -46,6 +46,7 @@ REPEAT_STEPS = 1
 SEED = 0
 IGNORE_EOS = True
 TEMPERATURE = 0.6
+ENFORCE_EAGER = False
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -94,7 +95,7 @@ def build_chat_prompts(tokenizer):
 
 def run_minivllm(prompts, gpu_memory_utilization=0.9):
     llm = MiniVLLM(
-        enforce_eager=True,
+        enforce_eager=ENFORCE_EAGER,
         gpu_memory_utilization=gpu_memory_utilization,
         model_name_or_path=MODEL_NAME,
         custom_model_config=MODEL_CONFIG,
@@ -314,8 +315,13 @@ def parse_args():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.75,
-        help="GPU memory utilization passed to vLLM.",
+        default=0.9,
+        help="GPU memory utilization passed to mini-vLLM and vLLM.",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable mini-vLLM CUDA Graph capture and run eager decode.",
     )
     args = parser.parse_args()
     if args.output_tokens <= 0:
@@ -330,7 +336,7 @@ def parse_args():
 
 
 def main():
-    global OUTPUT_TOKENS, WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS
+    global OUTPUT_TOKENS, WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS, ENFORCE_EAGER
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark_tps.py requires a CUDA-capable GPU")
@@ -339,6 +345,7 @@ def main():
     REPEAT_STEPS = args.repeat
     SEED = args.seed
     IGNORE_EOS = not args.respect_eos
+    ENFORCE_EAGER = args.enforce_eager
     set_seed(SEED)
 
     tokenizer = AutoTokenizer.from_pretrained(

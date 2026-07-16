@@ -28,6 +28,23 @@ def report_correctness(
     return is_close
 
 
+def require_cuda() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("benchmark_decoding.py requires a CUDA-capable GPU")
+
+
+def assert_correctness(
+    name: str,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    atol: float = 2e-2,
+    rtol: float = 2e-2,
+    reference_name: str = "CPU PyTorch",
+) -> None:
+    if not report_correctness(name, reference, candidate, atol, rtol, reference_name):
+        raise AssertionError(f"{name} does not match {reference_name}")
+
+
 def decode_pytorch_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -228,7 +245,7 @@ def benchmark(
     gpu_time = (time.perf_counter() - start) / num_iterations
     results["GPU PyTorch FP16"] = gpu_time
     print(f"   Time: {gpu_time * 1000:.3f} ms")
-    report_correctness("GPU PyTorch FP16", out_cpu, out_gpu)
+    assert_correctness("GPU PyTorch FP16", out_cpu, out_gpu)
 
     print(f"\n[3/3] GPU Triton PagedAttention (FP16, {num_iterations} iterations)...")
     for _ in range(10):
@@ -243,8 +260,8 @@ def benchmark(
     triton_time = (time.perf_counter() - start) / num_iterations
     results["GPU Triton FP16"] = triton_time
     print(f"   Time: {triton_time * 1000:.3f} ms")
-    report_correctness("GPU Triton FP16", out_cpu, out_triton)
-    report_correctness(
+    assert_correctness("GPU Triton FP16", out_cpu, out_triton)
+    assert_correctness(
         "GPU Triton FP16",
         out_gpu,
         out_triton,
@@ -259,6 +276,7 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    require_cuda()
     torch.manual_seed(0)
 
     print("\n" + "=" * 70)
