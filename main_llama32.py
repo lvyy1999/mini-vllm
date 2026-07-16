@@ -56,7 +56,7 @@ def main():
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
         "introduce yourself",  # * 15,
-        "list all prime numbers within 100",  # * 15,
+        "list all prime numbers less than 100",  # * 15,
         "give me your opinion on the impact of artificial intelligence on society",  # * 15,
     ]  # * 30
     prompts = [

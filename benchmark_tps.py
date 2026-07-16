@@ -36,7 +36,7 @@ MODEL_CONFIG = {
 
 PROMPTS = [
     "introduce yourself",
-    "list all prime numbers within 100",
+    "list all prime numbers less than 100",
     "give me your opinion on the impact of artificial intelligence on society",
 ]
 
@@ -47,6 +47,7 @@ SEED = 0
 IGNORE_EOS = True
 TEMPERATURE = 0.6
 ENFORCE_EAGER = False
+MODEL_DTYPE = MODEL_CONFIG["torch_dtype"]
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -59,6 +60,14 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def torch_dtype_from_name(dtype: str) -> torch.dtype:
+    return {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[dtype]
 
 
 def summarize_measurements(measurements):
@@ -94,11 +103,13 @@ def build_chat_prompts(tokenizer):
 
 
 def run_minivllm(prompts, gpu_memory_utilization=0.9):
+    model_config = dict(MODEL_CONFIG)
+    model_config["torch_dtype"] = MODEL_DTYPE
     llm = MiniVLLM(
         enforce_eager=ENFORCE_EAGER,
         gpu_memory_utilization=gpu_memory_utilization,
         model_name_or_path=MODEL_NAME,
-        custom_model_config=MODEL_CONFIG,
+        custom_model_config=model_config,
     )
 
     sampling = MiniSamplingParams(
@@ -155,7 +166,7 @@ def run_vllm(tokenizer, prompts, gpu_memory_utilization):
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         speculative_config=None,
-        dtype="float16",
+        dtype=MODEL_DTYPE,
     )
 
     sampling = VLLMSamplingParams(
@@ -200,7 +211,7 @@ def run_transformers_test(tokenizer, prompts):
         device
     )
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.float16
+        MODEL_NAME, torch_dtype=torch_dtype_from_name(MODEL_DTYPE)
     ).to(device)
     model.eval()
     if IGNORE_EOS:
@@ -323,6 +334,12 @@ def parse_args():
         action="store_true",
         help="Disable mini-vLLM CUDA Graph capture and run eager decode.",
     )
+    parser.add_argument(
+        "--model-dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default=MODEL_DTYPE,
+        help="Model dtype used by mini-vLLM, vLLM, and transformers backends.",
+    )
     args = parser.parse_args()
     if args.output_tokens <= 0:
         parser.error("--output-tokens must be greater than 0")
@@ -336,7 +353,7 @@ def parse_args():
 
 
 def main():
-    global OUTPUT_TOKENS, WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS, ENFORCE_EAGER
+    global OUTPUT_TOKENS, WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS, ENFORCE_EAGER, MODEL_DTYPE
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark_tps.py requires a CUDA-capable GPU")
@@ -346,6 +363,7 @@ def main():
     SEED = args.seed
     IGNORE_EOS = not args.respect_eos
     ENFORCE_EAGER = args.enforce_eager
+    MODEL_DTYPE = args.model_dtype
     set_seed(SEED)
 
     tokenizer = AutoTokenizer.from_pretrained(

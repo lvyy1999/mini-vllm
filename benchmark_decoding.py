@@ -59,10 +59,9 @@ def decode_pytorch_attention(
     head_dim: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Paged-KV decode baseline that runs on the input tensors' device."""
+    """Paged-KV decode baseline with FP32 scores/softmax for stable comparison."""
     batch_size = q.shape[0]
     device = q.device
-    dtype = q.dtype
 
     padded_k = torch.zeros(
         batch_size,
@@ -70,19 +69,24 @@ def decode_pytorch_attention(
         num_kv_heads,
         head_dim,
         device=device,
-        dtype=dtype,
+        dtype=torch.float32,
     )
     padded_v = torch.zeros_like(padded_k)
+    q_float = q.float()
 
     for i, seq_len in enumerate(context_lens_host):
         num_blocks_needed = (seq_len + block_size - 1) // block_size
         valid_blocks = block_tables[i, :num_blocks_needed]
 
         if num_blocks_needed > 0:
-            gathered_k = k_cache[valid_blocks].reshape(-1, num_kv_heads, head_dim)[
+            gathered_k = k_cache[valid_blocks].float().reshape(
+                -1, num_kv_heads, head_dim
+            )[
                 :seq_len
             ]
-            gathered_v = v_cache[valid_blocks].reshape(-1, num_kv_heads, head_dim)[
+            gathered_v = v_cache[valid_blocks].float().reshape(
+                -1, num_kv_heads, head_dim
+            )[
                 :seq_len
             ]
             padded_k[i, :seq_len] = gathered_k
@@ -93,15 +97,15 @@ def decode_pytorch_attention(
         padded_k = padded_k.repeat_interleave(num_groups, dim=2)
         padded_v = padded_v.repeat_interleave(num_groups, dim=2)
 
-    q = q.unsqueeze(2)
+    q_float = q_float.unsqueeze(2)
     padded_k = padded_k.transpose(1, 2)
     padded_v = padded_v.transpose(1, 2)
 
-    attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
+    attn_scores = torch.matmul(q_float, padded_k.transpose(-2, -1)) * scale
     mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
     attn_scores = attn_scores.masked_fill(~mask[:, None, None, :], float("-inf"))
     attn_probs = torch.softmax(attn_scores, dim=-1)
-    return torch.matmul(attn_probs, padded_v).squeeze(2)
+    return torch.matmul(attn_probs, padded_v).squeeze(2).to(q.dtype)
 
 
 def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size):
@@ -208,7 +212,10 @@ def benchmark(
     results["CPU PyTorch FP32"] = cpu_time
     print(f"   Time: {cpu_time * 1000:.3f} ms")
 
-    print(f"\n[2/3] GPU PyTorch baseline (FP16, {num_iterations} iterations)...")
+    print(
+        f"\n[2/3] GPU PyTorch baseline "
+        f"(FP16 inputs, FP32 softmax, {num_iterations} iterations)..."
+    )
     for _ in range(10):
         _ = decode_pytorch_attention(
             q_gpu,
@@ -243,9 +250,9 @@ def benchmark(
         )
     torch.cuda.synchronize()
     gpu_time = (time.perf_counter() - start) / num_iterations
-    results["GPU PyTorch FP16"] = gpu_time
+    results["GPU PyTorch FP16/FP32"] = gpu_time
     print(f"   Time: {gpu_time * 1000:.3f} ms")
-    assert_correctness("GPU PyTorch FP16", out_cpu, out_gpu)
+    assert_correctness("GPU PyTorch FP16/FP32", out_cpu, out_gpu)
 
     print(f"\n[3/3] GPU Triton PagedAttention (FP16, {num_iterations} iterations)...")
     for _ in range(10):
@@ -265,7 +272,7 @@ def benchmark(
         "GPU Triton FP16",
         out_gpu,
         out_triton,
-        reference_name="GPU PyTorch FP16",
+        reference_name="GPU PyTorch FP16/FP32",
     )
 
     print("\n   Speedups:")
@@ -281,7 +288,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 70)
     print("PAGED ATTENTION DECODE BENCHMARK")
-    print("Comparing: CPU PyTorch FP32 | GPU PyTorch FP16 | GPU Triton FP16")
+    print("Comparing: CPU PyTorch FP32 | GPU PyTorch FP16/FP32 | GPU Triton FP16")
     print(f"CPU threads: {torch.get_num_threads()}")
     print("=" * 70)
 

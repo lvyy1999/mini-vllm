@@ -55,7 +55,7 @@ def pytorch_standard_attention(
     num_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Standard causal attention that runs on the input tensors' device."""
+    """Standard causal attention with FP32 scores/softmax for stable comparison."""
     output = torch.zeros_like(q)
     cu_seqlens_cpu = cu_seqlens.cpu().tolist()
 
@@ -64,9 +64,9 @@ def pytorch_standard_attention(
         end = cu_seqlens_cpu[i + 1]
         seq_len = end - start
 
-        q_seq = q[start:end].transpose(0, 1)
-        k_seq = k[start:end].transpose(0, 1)
-        v_seq = v[start:end].transpose(0, 1)
+        q_seq = q[start:end].transpose(0, 1).float()
+        k_seq = k[start:end].transpose(0, 1).float()
+        v_seq = v[start:end].transpose(0, 1).float()
 
         if num_kv_heads != num_heads:
             num_groups = num_heads // num_kv_heads
@@ -81,7 +81,9 @@ def pytorch_standard_attention(
         attn_scores.masked_fill_(causal_mask.unsqueeze(0), float("-inf"))
 
         attn_probs = torch.softmax(attn_scores, dim=-1)
-        output[start:end] = torch.matmul(attn_probs, v_seq).transpose(0, 1)
+        output[start:end] = torch.matmul(attn_probs, v_seq).transpose(0, 1).to(
+            output.dtype
+        )
 
     return output
 
@@ -162,7 +164,10 @@ def benchmark(
     results["CPU PyTorch FP32"] = cpu_time
     print(f"      Time: {cpu_time * 1000:.3f} ms")
 
-    print(f"\n[2/3] GPU PyTorch baseline (FP16, {num_iter} iterations)...")
+    print(
+        f"\n[2/3] GPU PyTorch baseline "
+        f"(FP16 inputs, FP32 softmax, {num_iter} iterations)..."
+    )
     for _ in range(5):
         _ = pytorch_standard_attention(
             q_gpu,
@@ -189,9 +194,9 @@ def benchmark(
         )
     torch.cuda.synchronize()
     gpu_time = (time.perf_counter() - start) / num_iter
-    results["GPU PyTorch FP16"] = gpu_time
+    results["GPU PyTorch FP16/FP32"] = gpu_time
     print(f"      Time: {gpu_time * 1000:.3f} ms")
-    assert_correctness("GPU PyTorch FP16", out_cpu, out_gpu)
+    assert_correctness("GPU PyTorch FP16/FP32", out_cpu, out_gpu)
 
     print(f"\n[3/3] GPU Triton Flash Attention (FP16, {num_iter} iterations)...")
     for _ in range(5):
@@ -223,7 +228,7 @@ def benchmark(
         "GPU Triton FP16",
         out_gpu,
         out_triton,
-        reference_name="GPU PyTorch FP16",
+        reference_name="GPU PyTorch FP16/FP32",
     )
 
     print("\n      Speedups:")
@@ -239,7 +244,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 80)
     print("PREFILL ATTENTION BENCHMARK")
-    print("Comparing: CPU PyTorch FP32 | GPU PyTorch FP16 | GPU Triton FP16")
+    print("Comparing: CPU PyTorch FP32 | GPU PyTorch FP16/FP32 | GPU Triton FP16")
     print(f"CPU threads: {torch.get_num_threads()}")
     print("=" * 80)
 
