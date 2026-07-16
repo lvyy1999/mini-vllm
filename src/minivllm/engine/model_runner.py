@@ -469,7 +469,7 @@ class ModelRunner:
         )
 
         # capture graphs
-        graph_pool = None
+        self.graph_pool = None
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(
@@ -484,10 +484,10 @@ class ModelRunner:
             )
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
 
-            with torch.cuda.graph(graph, graph_pool):
+            with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
             # store the captured graph
             self.graphs[bs] = graph
             # make sure that the capture is done before resetting and next capture
