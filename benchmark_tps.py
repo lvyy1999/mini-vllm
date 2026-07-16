@@ -1,5 +1,6 @@
 import argparse
 import gc
+import random
 import sys
 import time
 from pathlib import Path
@@ -34,12 +35,8 @@ MODEL_CONFIG = {
     "vocab_size": 151936,
 }
 
-PROMPTS = [
-    "introduce yourself",
-    "list all prime numbers less than 100",
-    "give me your opinion on the impact of artificial intelligence on society",
-]
-
+INPUT_TOKENS = 128
+NUM_SEQUENCES = 3
 WARMUP_STEPS = 2
 OUTPUT_TOKENS = 256  # output token num
 REPEAT_STEPS = 1
@@ -91,23 +88,43 @@ def cleanup_cuda():
         torch.cuda.synchronize()
 
 
-def build_chat_prompts(tokenizer):
+def build_random_token_prompt_batches(
+    tokenizer,
+    input_tokens: int,
+    num_sequences: int,
+    num_batches: int,
+    seed: int,
+) -> list[list[list[int]]]:
+    special_token_ids = set(tokenizer.all_special_ids)
+    model_vocab_size = MODEL_CONFIG["vocab_size"]
+    candidate_token_ids = sorted(
+        {
+            token_id
+            for token_id in tokenizer.get_vocab().values()
+            if 0 <= token_id < model_vocab_size
+            and token_id not in special_token_ids
+        }
+    )
+    if not candidate_token_ids:
+        raise RuntimeError("Tokenizer has no non-special token IDs to sample from")
+
+    rng = random.Random(seed)
     return [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for p in PROMPTS
+        [
+            rng.choices(candidate_token_ids, k=input_tokens)
+            for _ in range(num_sequences)
+        ]
+        for _ in range(num_batches)
     ]
 
 
-def run_minivllm(prompts, gpu_memory_utilization=0.9):
+def run_minivllm(prompt_batches, gpu_memory_utilization=0.9):
     model_config = dict(MODEL_CONFIG)
     model_config["torch_dtype"] = MODEL_DTYPE
     llm = MiniVLLM(
         enforce_eager=ENFORCE_EAGER,
         gpu_memory_utilization=gpu_memory_utilization,
+        max_model_length=INPUT_TOKENS + OUTPUT_TOKENS,
         model_name_or_path=MODEL_NAME,
         custom_model_config=model_config,
     )
@@ -119,13 +136,13 @@ def run_minivllm(prompts, gpu_memory_utilization=0.9):
     )
 
     # warmup
-    for _ in range(WARMUP_STEPS):
+    for prompts in prompt_batches[:WARMUP_STEPS]:
         llm.generate(prompts, sampling, use_tqdm=False)
         cuda_sync()
 
     measurements = []
     outputs = None
-    for i in range(REPEAT_STEPS):
+    for i, prompts in enumerate(prompt_batches[WARMUP_STEPS:]):
         set_seed(SEED + i)
         start = time.perf_counter()
         outputs = llm.generate(prompts, sampling, use_tqdm=False)
@@ -148,15 +165,18 @@ def run_minivllm(prompts, gpu_memory_utilization=0.9):
     return result
 
 
-def run_vllm(tokenizer, prompts, gpu_memory_utilization):
+def run_vllm(prompt_batches, gpu_memory_utilization):
     try:
         from vllm import LLM as VLLM
         from vllm import SamplingParams as VLLMSamplingParams
     except ImportError as exc:
         return {"error": f"vLLM is not installed: {exc}"}
 
-    prompt_token_lens = [len(tokenizer.encode(prompt)) for prompt in prompts]
-    max_model_len = max(prompt_token_lens) + OUTPUT_TOKENS + 16
+    max_model_len = INPUT_TOKENS + OUTPUT_TOKENS
+    vllm_prompt_batches = [
+        [{"prompt_token_ids": prompt} for prompt in prompts]
+        for prompts in prompt_batches
+    ]
 
     # vLLM
     llm = VLLM(
@@ -176,13 +196,13 @@ def run_vllm(tokenizer, prompts, gpu_memory_utilization):
     )
 
     # warmup
-    for _ in range(WARMUP_STEPS):
+    for prompts in vllm_prompt_batches[:WARMUP_STEPS]:
         llm.generate(prompts, sampling, use_tqdm=False)
         cuda_sync()
 
     measurements = []
     outputs = None
-    for i in range(REPEAT_STEPS):
+    for i, prompts in enumerate(vllm_prompt_batches[WARMUP_STEPS:]):
         set_seed(SEED + i)
         start = time.perf_counter()
         outputs = llm.generate(prompts, sampling, use_tqdm=False)
@@ -205,24 +225,17 @@ def run_vllm(tokenizer, prompts, gpu_memory_utilization):
     return result
 
 
-def run_transformers_test(tokenizer, prompts):
+def run_transformers_test(tokenizer, prompt_batches):
     # transformers
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(
-        device
-    )
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch_dtype_from_name(MODEL_DTYPE)
+        MODEL_NAME, dtype=torch_dtype_from_name(MODEL_DTYPE)
     ).to(device)
     model.eval()
     if IGNORE_EOS:
         model.generation_config.eos_token_id = None
 
-    # Prepare attention_mask explicitly
-    attention_mask = inputs["attention_mask"]
-
     # warmup
     generation_kwargs = dict(
-        attention_mask=attention_mask,
         max_new_tokens=OUTPUT_TOKENS,
         do_sample=True,
         temperature=TEMPERATURE,
@@ -231,22 +244,31 @@ def run_transformers_test(tokenizer, prompts):
     if IGNORE_EOS:
         generation_kwargs["eos_token_id"] = None
 
-    for _ in range(WARMUP_STEPS):
+    for prompts in prompt_batches[:WARMUP_STEPS]:
+        input_ids = torch.tensor(prompts, dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
-            model.generate(inputs["input_ids"], **generation_kwargs)
+            model.generate(
+                input_ids, attention_mask=attention_mask, **generation_kwargs
+            )
         cuda_sync()
 
-    input_length = inputs["input_ids"].shape[1]
     measurements = []
     outputs = None
-    for i in range(REPEAT_STEPS):
+    for i, prompts in enumerate(prompt_batches[WARMUP_STEPS:]):
+        input_ids = torch.tensor(prompts, dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        cuda_sync()
         set_seed(SEED + i)
         start = time.perf_counter()
         with torch.inference_mode():
-            outputs = model.generate(inputs["input_ids"], **generation_kwargs)
+            outputs = model.generate(
+                input_ids, attention_mask=attention_mask, **generation_kwargs
+            )
         cuda_sync()
         end = time.perf_counter()
 
+        input_length = input_ids.shape[1]
         total_tokens = sum(max(0, len(output) - input_length) for output in outputs)
         latency = end - start
         measurements.append(
@@ -258,7 +280,7 @@ def run_transformers_test(tokenizer, prompts):
         )
 
     result = summarize_measurements(measurements)
-    del model, outputs
+    del model, outputs, input_ids, attention_mask
     cleanup_cuda()
     return result
 
@@ -293,6 +315,18 @@ def parse_args():
         choices=["minivllm", "vllm", "transformers"],
         required=True,
         help="Which single backend to benchmark.",
+    )
+    parser.add_argument(
+        "--input-tokens",
+        type=int,
+        default=INPUT_TOKENS,
+        help="Number of randomly sampled input tokens per sequence.",
+    )
+    parser.add_argument(
+        "--num-sequences",
+        type=int,
+        default=NUM_SEQUENCES,
+        help="Number of random input sequences in each generation batch.",
     )
     parser.add_argument(
         "--output-tokens",
@@ -341,8 +375,20 @@ def parse_args():
         help="Model dtype used by mini-vLLM, vLLM, and transformers backends.",
     )
     args = parser.parse_args()
+    if args.input_tokens <= 0:
+        parser.error("--input-tokens must be greater than 0")
+    if args.num_sequences <= 0:
+        parser.error("--num-sequences must be greater than 0")
     if args.output_tokens <= 0:
         parser.error("--output-tokens must be greater than 0")
+    if (
+        args.input_tokens + args.output_tokens
+        > MODEL_CONFIG["max_position_embeddings"]
+    ):
+        parser.error(
+            "--input-tokens + --output-tokens must not exceed "
+            f"{MODEL_CONFIG['max_position_embeddings']}"
+        )
     if args.warmup_steps < 0:
         parser.error("--warmup-steps must be at least 0")
     if args.repeat <= 0:
@@ -353,10 +399,14 @@ def parse_args():
 
 
 def main():
-    global OUTPUT_TOKENS, WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS, ENFORCE_EAGER, MODEL_DTYPE
+    global INPUT_TOKENS, NUM_SEQUENCES, OUTPUT_TOKENS
+    global WARMUP_STEPS, REPEAT_STEPS, SEED, IGNORE_EOS
+    global ENFORCE_EAGER, MODEL_DTYPE
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark_tps.py requires a CUDA-capable GPU")
+    INPUT_TOKENS = args.input_tokens
+    NUM_SEQUENCES = args.num_sequences
     OUTPUT_TOKENS = args.output_tokens
     WARMUP_STEPS = args.warmup_steps
     REPEAT_STEPS = args.repeat
@@ -371,21 +421,39 @@ def main():
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    prompts = build_chat_prompts(tokenizer)
+    # Keep warmup and timed prompts distinct so prefix caching cannot inflate TPS.
+    prompt_batches = build_random_token_prompt_batches(
+        tokenizer,
+        INPUT_TOKENS,
+        NUM_SEQUENCES,
+        WARMUP_STEPS + REPEAT_STEPS,
+        SEED,
+    )
+
+    print(
+        f"Benchmark input: {NUM_SEQUENCES} sequences x {INPUT_TOKENS} random tokens; "
+        f"output tokens per sequence: {OUTPUT_TOKENS}"
+    )
 
     results = {}
 
     if args.backend == "minivllm":
         print("Running minivllm benchmark...")
-        results["minivllm"] = run_minivllm(prompts, args.gpu_memory_utilization)
+        results["minivllm"] = run_minivllm(
+            prompt_batches, args.gpu_memory_utilization
+        )
 
     if args.backend == "vllm":
         print("Running vLLM benchmark...")
-        results["vLLM"] = run_vllm(tokenizer, prompts, args.gpu_memory_utilization)
+        results["vLLM"] = run_vllm(
+            prompt_batches, args.gpu_memory_utilization
+        )
 
     if args.backend == "transformers":
         print("Running transformers benchmark...")
-        results["transformers"] = run_transformers_test(tokenizer, prompts)
+        results["transformers"] = run_transformers_test(
+            tokenizer, prompt_batches
+        )
 
     print_results(results)
 
