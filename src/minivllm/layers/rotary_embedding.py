@@ -6,16 +6,10 @@ import torch.nn as nn
 def apply_rope_adjacent(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    if x.dim() == 3:  # (total_tokens, num_heads, head_dim)
-        # cos, sin shape: (seq_len, head_dim/2) -> (seq_len, 1, head_dim/2)
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-    else:  # (B, seq_len, num_heads, head_dim)
-        # cos, sin shape: (seq_len, head_dim/2) -> (1, seq_len, 1, head_dim/2)
-        cos = cos.unsqueeze(0).unsqueeze(2)
-        sin = sin.unsqueeze(0).unsqueeze(2)
     # Split x into two halves by interleaved mode
     # x0, x2, ...
+    origin_dtype = x.dtype
+    x = x.float()
     x_even = x[..., ::2]
     # x1, x3, ...
     x_odd = x[..., 1::2]
@@ -25,29 +19,22 @@ def apply_rope_adjacent(
     y_even = x_even * cos - x_odd * sin
     y_odd = x_odd * cos + x_even * sin
     y = torch.zeros_like(x)
-    y[:, ::2] = y_even
-    y[:, 1::2] = y_odd
-    return y
+    y[..., ::2] = y_even
+    y[..., 1::2] = y_odd
+    return y.to(origin_dtype)
 
 
 # apply rope between two elements at a distance of head_dim / 2
 def apply_rotary_pos_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    if x.dim() == 3:  # (total_tokens, num_heads, head_dim)
-        # cos, sin shape: (seq_len, head_dim/2) -> (seq_len, 1, head_dim/2)
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-    else:  # (B, seq_len, num_heads, head_dim)
-        # cos, sin shape: (seq_len, head_dim/2) -> (1, seq_len, 1, head_dim/2)
-        cos = cos.unsqueeze(0).unsqueeze(2)
-        sin = sin.unsqueeze(0).unsqueeze(2)
     # Split x into two halves along the head dimension
-    x1, x2 = x.chunk(2, dim=-1)
+    origin_dtype = x.dtype
+    x1, x2 = x.float().chunk(2, dim=-1)
     # Apply rotary embedding with proper broadcasting
     y1 = x1 * cos - x2 * sin
     y2 = x1 * sin + x2 * cos
-    return torch.cat([y1, y2], dim=-1).to(x.dtype)
+    return torch.cat([y1, y2], dim=-1).to(origin_dtype)
 
 
 class RotaryEmbedding(nn.Module):
@@ -67,7 +54,7 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
 
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, head_dim, 2) / head_dim)
+            base ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim)
         )  # shape(head_dim/2, )
 
         if is_llama3:
@@ -94,11 +81,11 @@ class RotaryEmbedding(nn.Module):
                 factor = (1 - smooth) / llama3_rope_factor + smooth
                 inv_freq = factor * inv_freq
 
-        positions = torch.arange(max_position).float()  # shape(max_seq_len, )
+        positions = torch.arange(max_position, dtype=torch.float)  # shape(max_seq_len, )
         angles = torch.outer(positions, inv_freq)  # shape(max_seq_len, head_dim/2)
         cos = torch.cos(angles)  # shape(max_seq_len, head_dim/2)
         sin = torch.sin(angles)  # shape(max_seq_len, head_dim/2)
-        cos_sin_cache = torch.cat([cos, sin], dim=-1)  # shape(max_seq_len, head_dim)
+        cos_sin_cache = torch.cat([cos, sin], dim=-1).unsqueeze(1)  # shape(max_seq_len, 1, head_dim)
         self.register_buffer("cos_sin_cache", cos_sin_cache)
 
     @torch.compile
