@@ -115,7 +115,7 @@ class BlockManager:
         cache_missed = False
         num_cached_blocks = 0
         for i in range(seq.num_blocks):
-            if not cache_missed:
+            if not cache_missed and i != seq.num_blocks - 1:  # the last block cannot use cached block
                 token_ids = seq.block(i)
                 # find in cache by prefix hash
                 h = self.compute_hash(token_ids, h)
@@ -123,6 +123,7 @@ class BlockManager:
                 # maybe exist hash collision, so need to check token_ids
                 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                     cache_missed = True  # cache missed
+                    seq.block_table.append(self._allocate_block())
                 else:
                     num_cached_blocks += 1
                     if block_id in self.used_block_ids:
@@ -135,7 +136,7 @@ class BlockManager:
                         self.used_block_ids.add(block_id)
                         self.free_block_ids.remove(block_id)
                     seq.block_table.append(block_id)
-            if cache_missed:  # cache missed, need to allocate a new block
+            else:  # cache missed, or be the last block, need to allocate a new block
                 seq.block_table.append(self._allocate_block())
         # calculate the number of cached tokens
         seq.num_cached_tokens = num_cached_blocks * self.block_size
