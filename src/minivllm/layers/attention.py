@@ -12,9 +12,12 @@ def store_kvcache_kernel(
     value_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
     slot_mapping_ptr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    kv_cache_int8: tl.constexpr,
 ):
     """
     Store keys and values into paged KV cache.
@@ -49,12 +52,41 @@ def store_kvcache_kernel(
         + head_idx * head_dim  # skip previous heads
         + head_offsets
     )
-    # load key and value floats from the pointers' memory
+    # load key and value from the pointers' memory
     key = tl.load(key_ptr + input_offsets)
     value = tl.load(value_ptr + input_offsets)
-    # store into cache
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+
+    if kv_cache_int8:  # int8 quantization for k/v cache if needed
+        key_f32 = key.to(tl.float32)
+        value_f32 = value.to(tl.float32)
+        # calculate scale factor
+        key_abs_max = tl.max(tl.abs(key_f32), axis=0)
+        value_abs_max = tl.max(tl.abs(value_f32), axis=0)
+        key_scale = tl.where(key_abs_max > 0.0, key_abs_max / 127.0, 1.0)
+        value_scale = tl.where(value_abs_max > 0.0, value_abs_max / 127.0, 1.0)
+        # clamp to [-127, 127]
+        key_scaled = tl.maximum(tl.minimum(key_f32 / key_scale, 127.0), -127.0)
+        value_scaled = tl.maximum(tl.minimum(value_f32 / value_scale, 127.0), -127.0)
+        # round to the nearest integer and convert to int8
+        key_quantized = tl.where(
+            key_scaled >= 0.0,
+            tl.floor(key_scaled + 0.5),
+            tl.ceil(key_scaled - 0.5),
+        ).to(tl.int8)
+        value_quantized = tl.where(
+            value_scaled >= 0.0,
+            tl.floor(value_scaled + 0.5),
+            tl.ceil(value_scaled - 0.5),
+        ).to(tl.int8)
+        # calculate scale offset and store
+        scale_offset = slot_idx * num_kv_heads + head_idx
+        tl.store(k_cache_ptr + cache_offsets, key_quantized)
+        tl.store(v_cache_ptr + cache_offsets, value_quantized)
+        tl.store(k_scale_cache_ptr + scale_offset, key_scale)
+        tl.store(v_scale_cache_ptr + scale_offset, value_scale)
+    else:  # store into cache directly
+        tl.store(k_cache_ptr + cache_offsets, key)
+        tl.store(v_cache_ptr + cache_offsets, value)
 
 
 def store_kvcache(
@@ -63,6 +95,8 @@ def store_kvcache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ):
     """
     Store key-value pairs into paged cache.
@@ -73,6 +107,8 @@ def store_kvcache(
         k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         slot_mapping: (num_tokens,) - maps each token to a cache slot
+        k_scale_cache: (num_blocks, block_size, num_kv_heads)
+        v_scale_cache: (num_blocks, block_size, num_kv_heads)
     """
     num_tokens, num_kv_heads, head_dim = key.shape
 
@@ -87,6 +123,15 @@ def store_kvcache(
         slot_mapping.numel() == num_tokens
     ), "Slot mapping size must match number of tokens"
 
+    kv_cache_int8 = k_cache.dtype == torch.int8
+    if kv_cache_int8:
+        assert k_scale_cache is not None and v_scale_cache is not None
+        assert k_scale_cache.shape == v_scale_cache.shape
+        assert k_scale_cache.shape == k_cache.shape[:-1]
+    else:  # avoid to pass null pointer to kernel
+        k_scale_cache = k_cache
+        v_scale_cache = v_cache
+
     # each thread responsible for one head of one token
     grid = (num_tokens, num_kv_heads)
     # launch num_tokens x num_kv_heads threads
@@ -95,9 +140,12 @@ def store_kvcache(
         value,
         k_cache,
         v_cache,
+        k_scale_cache,
+        v_scale_cache,
         slot_mapping,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        kv_cache_int8=kv_cache_int8,
     )
 
 
@@ -106,6 +154,8 @@ def flash_attention_prefill_with_cache_kernel(
     q_ptr,  # (total_q, num_heads, head_dim)
     k_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads, head_dim)
     v_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads, head_dim)
+    k_scale_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads)
+    v_scale_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads)
     o_ptr,  # (total_q, num_heads, head_dim)
     scale,
     block_tables_ptr,
@@ -116,6 +166,7 @@ def flash_attention_prefill_with_cache_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     max_num_blocks: tl.constexpr,
+    kv_cache_int8: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -194,11 +245,21 @@ def flash_attention_prefill_with_cache_kernel(
             + kv_head_idx * head_dim
             + head_offset[None, :]
         )  # (BLOCK_N, head_dim)
+        kv_scale_offset = (
+            physical_block_idx * block_size * num_kv_heads
+            + logical_block_offset * num_kv_heads
+            + kv_head_idx
+        )  # (BLOCK_N, )
 
         # Load Kj block and compute S = QK^T / sqrt(d)
         k_j = tl.load(
             k_cache_ptr + kv_cache_offset, mask=kv_mask[:, None], other=0.0
         )  # shape (BLOCK_N, head_dim)
+        if kv_cache_int8:  # dequantization
+            k_scale = tl.load(
+                k_scale_cache_ptr + kv_scale_offset, mask=kv_mask, other=0.0
+            )  # shape(BLOCK_N, )
+            k_j = (k_j.to(tl.float32) * k_scale[:, None]).to(q_i.dtype)
         # s_ij = tl.dot(q_i, k_j, trans_b=True)
         s_ij = tl.dot(q_i, tl.trans(k_j)) * scale  # shape (BLOCK_M, BLOCK_N)
 
@@ -217,6 +278,11 @@ def flash_attention_prefill_with_cache_kernel(
         v_j = tl.load(
             v_cache_ptr + kv_cache_offset, mask=kv_mask[:, None], other=0.0
         )  # shape (BLOCK_N, head_dim)
+        if kv_cache_int8:  # dequantization
+            v_scale = tl.load(
+                v_scale_cache_ptr + kv_scale_offset, mask=kv_mask, other=0.0
+            )  # shape(BLOCK_N, )
+            v_j = (v_j.to(tl.float32) * v_scale[:, None]).to(q_i.dtype)
         acc = acc * alpha[:, None] + tl.dot(p_ij.to(v_j.dtype), v_j)
 
     # Final normalization and store output
@@ -331,6 +397,8 @@ def flash_attention_prefill(
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
     block_tables: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Flash Attention for prefill with variable-length sequences.
@@ -380,14 +448,22 @@ def flash_attention_prefill(
     # launch num_heads × num_blocks x num_batches threads
     if block_tables is not None:  # chunked prefill, k/v should be k_cache/v_cache
         k_cache, v_cache = k, v  # (num_blocks, block_size, num_kv_heads, head_dim)
+        kv_cache_int8 = k_cache.dtype == torch.int8
+        if kv_cache_int8:
+            assert k_scale_cache is not None and v_scale_cache is not None
+            assert k_scale_cache.shape == v_scale_cache.shape
+            assert k_scale_cache.shape == k_cache.shape[:-1]
+        else:  # avoid to pass null pointer to kernel
+            k_scale_cache = k_cache
+            v_scale_cache = v_cache
         block_size = k_cache.shape[1]
         num_kv_heads = k_cache.shape[2]
         max_num_blocks = block_tables.shape[1]
         cu_seqlens_k = cu_seqlens_k if cu_seqlens_k is not None else cu_seqlens_q
         flash_attention_prefill_with_cache_kernel[grid](
-            q,
-            k_cache,
-            v_cache,
+            q, k_cache, v_cache,
+            k_scale_cache,
+            v_scale_cache,
             output,
             scale,
             block_tables,
@@ -398,6 +474,7 @@ def flash_attention_prefill(
             head_dim=head_dim,
             block_size=block_size,
             max_num_blocks=max_num_blocks,
+            kv_cache_int8=kv_cache_int8,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
         )
@@ -406,9 +483,7 @@ def flash_attention_prefill(
         v = v.contiguous()
         num_kv_heads = k.shape[1]
         flash_attention_prefill_without_cache_kernel[grid](
-            q,
-            k,
-            v,
+            q, k, v,
             output,
             scale,
             cu_seqlens_q,
@@ -427,6 +502,8 @@ def flash_attention_decode_with_cache_kernel(
     q_ptr,  # (batch_size, num_heads, head_dim)
     k_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads, head_dim)
     v_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads, head_dim)
+    k_scale_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads)
+    v_scale_cache_ptr,  # (max_num_blocks, block_size, num_kv_heads)
     output_ptr,
     scale,
     block_tables_ptr,
@@ -436,6 +513,7 @@ def flash_attention_decode_with_cache_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     max_num_blocks: tl.constexpr,
+    kv_cache_int8: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """
@@ -486,11 +564,21 @@ def flash_attention_decode_with_cache_kernel(
             + kv_head_idx * head_dim
             + head_offset[None, :]
         )  # (BLOCK_N, head_dim)
+        kv_scale_offset = (
+            physical_block_idx * block_size * num_kv_heads
+            + logical_block_offset * num_kv_heads
+            + kv_head_idx
+        )  # (BLOCK_N, )
 
         # Load Kj block and compute attention scores: S = qK^T / sqrt(d)
         k_j = tl.load(
             k_cache_ptr + kv_cache_offset, mask=kv_mask[:, None], other=0.0
-        )  # shape (BLOCK_N, head_dim)
+        )  # shape(BLOCK_N, head_dim)
+        if kv_cache_int8:  # dequantization
+            k_scale = tl.load(
+                k_scale_cache_ptr + kv_scale_offset, mask=kv_mask, other=0.0
+            )  # shape(BLOCK_N, )
+            k_j = (k_j.to(tl.float32) * k_scale[:, None]).to(q.dtype)
         s = tl.sum(k_j * q[None, :], axis=1) * scale  # shape(BLOCK_N, )
         s = tl.where(kv_mask, s, -1e10)
 
@@ -505,6 +593,11 @@ def flash_attention_decode_with_cache_kernel(
         v_j = tl.load(
             v_cache_ptr + kv_cache_offset, mask=kv_mask[:, None], other=0.0
         )  # shape (BLOCK_N, head_dim)
+        if kv_cache_int8:  # dequantization
+            v_scale = tl.load(
+                v_scale_cache_ptr + kv_scale_offset, mask=kv_mask, other=0.0
+            )  # shape(BLOCK_N, )
+            v_j = (v_j.to(tl.float32) * v_scale[:, None]).to(q.dtype)
         acc = acc * alpha + tl.sum(
             p[:, None].to(v_j.dtype) * v_j, axis=0
         )  # shape(head_dim, )
@@ -520,6 +613,8 @@ def flash_attention_decode(
     scale: float,
     cache_seqlens: torch.Tensor,
     block_tables: torch.Tensor,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute attention in decode mode using paged KV cache.
@@ -550,6 +645,15 @@ def flash_attention_decode(
     # choose chunk size for processing K/V caches
     BLOCK_N = 64 if head_dim <= 128 else 32
 
+    kv_cache_int8 = k_cache.dtype == torch.int8
+    if kv_cache_int8:
+        assert k_scale_cache is not None and v_scale_cache is not None
+        assert k_scale_cache.shape == v_scale_cache.shape
+        assert k_scale_cache.shape == k_cache.shape[:-1]
+    else:  # avoid to pass null pointer to kernel
+        k_scale_cache = k_cache
+        v_scale_cache = v_cache
+
     # each thread responsible for one head of one batch
     grid = (num_heads, batch_size)
     # launch batch_size x num_heads threads
@@ -557,6 +661,8 @@ def flash_attention_decode(
         q,
         k_cache,
         v_cache,
+        k_scale_cache,
+        v_scale_cache,
         output,
         scale,
         block_tables,
@@ -566,6 +672,7 @@ def flash_attention_decode(
         head_dim=head_dim,
         block_size=block_size,
         max_num_blocks=max_num_blocks,
+        kv_cache_int8=kv_cache_int8,
         BLOCK_N=BLOCK_N,
     )
 
@@ -587,42 +694,46 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale_cache = self.v_scale_cache = torch.tensor([])
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        kv_cache_int8 = k_cache.dtype == torch.int8  # whether to use int8 quantization for k/v cache
         # Store current k, v into cache if cache is allocated
-        if (
-            k_cache.numel() > 0
-            and v_cache.numel() > 0
-            and context.slot_mapping is not None
-        ):
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
+            if kv_cache_int8:  # use int8 quantization
+                store_kvcache(
+                    k, v, k_cache, v_cache,
+                    context.slot_mapping,
+                    self.k_scale_cache,
+                    self.v_scale_cache
+                )
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:  # Prefill
             if context.block_tables is not None:  # chunked prefill
                 k, v = k_cache, v_cache
-            o = flash_attention_prefill(
-                q,
-                k,
-                v,
+            return flash_attention_prefill(
+                q, k, v,
                 scale=self.scale,
                 cu_seqlens_q=context.cu_seqlens_q,
                 cu_seqlens_k=context.cu_seqlens_k,
                 max_seqlen_q=context.max_seqlen_q,
                 max_seqlen_k=context.max_seqlen_k,
                 block_tables=context.block_tables,
+                k_scale_cache=self.k_scale_cache if kv_cache_int8 else None,
+                v_scale_cache=self.v_scale_cache if kv_cache_int8 else None,
             )
-            return o
         else:  # Decode
-            o = flash_attention_decode(
-                q,
-                k_cache,
-                v_cache,
+            return flash_attention_decode(
+                q, k_cache, v_cache,
                 scale=self.scale,
                 cache_seqlens=context.context_lens,
                 block_tables=context.block_tables,
+                k_scale_cache=self.k_scale_cache if kv_cache_int8 else None,
+                v_scale_cache=self.v_scale_cache if kv_cache_int8 else None,
             )
-            return o

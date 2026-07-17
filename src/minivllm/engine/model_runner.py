@@ -37,9 +37,11 @@ class ModelRunner:
         torch.cuda.set_device(rank)
 
         # set default device and dtype for model
-        self.model_dtype = dtype_mapping[
-            config.custom_model_config.get("torch_dtype", "float16")
-        ]
+        torch_dtype = config.custom_model_config.get("torch_dtype", "float16")
+        assert torch_dtype in dtype_mapping, f"Unsupported model dtype: {torch_dtype}"
+        self.model_dtype = dtype_mapping[torch_dtype]
+        self.kv_cache_int8 = config.kv_cache_dtype == 'int8'
+        self.kv_cache_dtype = torch.int8 if self.kv_cache_int8 else self.model_dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_device(f"cuda:{rank}")
         torch.set_default_dtype(self.model_dtype)
@@ -178,13 +180,11 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # calculate the actual bytes required of each block
+        data_bytes = self.head_dim * self.kv_cache_dtype.itemsize
+        scale_bytes = torch.float32.itemsize if self.kv_cache_int8 else 0
         block_bytes = (
-            2
-            * self.num_layers
-            * self.block_size
-            * self.num_kv_heads
-            * self.head_dim
-            * self.model_dtype.itemsize
+            2 * self.num_layers * self.block_size * self.num_kv_heads
+            * (data_bytes + scale_bytes)
         )
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert (
@@ -225,14 +225,26 @@ class ModelRunner:
             self.block_size,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.model_dtype,
+            dtype=self.kv_cache_dtype,
             device=f"cuda:{self.rank}",
         )
+        kv_scale_cache = torch.zeros(
+            2,
+            self.num_layers,
+            self.config.max_cache_blocks,
+            self.block_size,
+            self.num_kv_heads,
+            dtype=torch.float32,
+            device=f"cuda:{self.rank}",
+        ) if self.kv_cache_int8 else None
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = kv_cache[0, layer_id]
                 module.v_cache = kv_cache[1, layer_id]
+                if self.kv_cache_int8:
+                    module.k_scale_cache = kv_scale_cache[0, layer_id]
+                    module.v_scale_cache = kv_scale_cache[1, layer_id]
                 layer_id += 1
 
     # prepare block tables with padding for chunked prefill or decode

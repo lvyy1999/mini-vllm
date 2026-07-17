@@ -10,6 +10,7 @@ class Config:
     max_model_length: int = 4096
     cache_block_size: int = 256
     max_cache_blocks: int = -1
+    kv_cache_dtype: str = 'auto'
     enforce_eager: bool = False
     eos_token_id: int = -1
     world_size: int = 1
@@ -21,6 +22,7 @@ class Config:
 
     def __post_init__(self):
         assert 1 <= self.world_size <= 8
+        assert self.kv_cache_dtype in ('auto', 'int8')
         assert (
                 self.cache_block_size > 0
                 and (self.cache_block_size & (self.cache_block_size - 1)) == 0  # must be power of 2
