@@ -6,7 +6,7 @@
 python3 -m pytest tests/test_model_runner.py -v
 ```
 
-测试不会调用 `ModelRunner.__init__`，因此不会初始化 NCCL、加载模型或申请显存。输入准备测试会将 `.cuda()` 临时替换为 CPU 原样返回，用于验证生成的数据内容。
+测试不会调用 `ModelRunner.__init__`，因此不会初始化 NCCL 或加载模型。输入准备测试会将 `.cuda()` 临时替换为 CPU 原样返回；缓存分配测试会模拟 CUDA 显存查询，并将张量实际分配到 CPU，避免占用显存。
 
 ## 覆盖范围
 
@@ -22,6 +22,12 @@ python3 -m pytest tests/test_model_runner.py -v
 - Prefill 正确生成 token、position、累计序列长度、slot mapping 和 chunked prefill 块表。
 - Decode 正确生成最后一个 token、上下文长度、写入槽位和块表。
 - 各序列 temperature 按 FP32 张量传入 sampler。
+
+### TestKVCacheAllocation
+
+- 验证 INT8 KV Cache 的容量计算同时计入 K/V 数据和 FP32 scale。
+- 验证每层 K/V Cache 使用 INT8，并分配形状匹配的 FP32 K/V scale cache。
+- 验证计算得到的最大缓存块数会写回配置。
 
 ### TestModelExecution
 

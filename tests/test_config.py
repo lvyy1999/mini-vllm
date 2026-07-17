@@ -17,6 +17,7 @@ class TestConfigDefaults:
         assert config.enforce_eager is False
         assert config.eos_token_id == -1
         assert config.world_size == 1
+        assert config.kv_cache_dtype == "auto"
 
     def test_custom_model_configs_are_not_shared(self):
         first = Config()
@@ -49,6 +50,20 @@ class TestCacheBlockSizeValidation:
     def test_rejects_non_positive_or_non_power_of_two_sizes(self, block_size):
         with pytest.raises(AssertionError):
             Config(cache_block_size=block_size)
+
+
+class TestKVCacheDtypeValidation:
+
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "int8"])
+    def test_accepts_supported_kv_cache_dtypes(self, kv_cache_dtype):
+        config = Config(kv_cache_dtype=kv_cache_dtype)
+
+        assert config.kv_cache_dtype == kv_cache_dtype
+
+    @pytest.mark.parametrize("kv_cache_dtype", ["float16", "int4", "", None])
+    def test_rejects_unsupported_kv_cache_dtypes(self, kv_cache_dtype):
+        with pytest.raises(AssertionError):
+            Config(kv_cache_dtype=kv_cache_dtype)
 
 
 class TestModelLengthResolution:

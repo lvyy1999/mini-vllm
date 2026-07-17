@@ -11,6 +11,7 @@ python3 -m pytest tests/test_config.py -v
 ### TestConfigDefaults
 
 - 检查引擎默认配置。
+- 验证 KV Cache 数据类型默认使用 `auto`。
 - 验证 `custom_model_config` 使用独立字典，不会在实例之间共享。
 
 ### TestWorldSizeValidation
@@ -22,6 +23,11 @@ python3 -m pytest tests/test_config.py -v
 
 - 接受正的 2 的幂次作为 KV Cache 块大小。
 - 拒绝非正数和非 2 的幂次。
+
+### TestKVCacheDtypeValidation
+
+- 接受 `auto` 和 `int8` 两种 KV Cache 数据类型。
+- 拒绝 `float16`、`int4`、空字符串和 `None` 等不支持的配置。
 
 ### TestModelLengthResolution
 

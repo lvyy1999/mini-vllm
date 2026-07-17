@@ -60,7 +60,7 @@ python3 -m pip install pytest
 python3 -m pytest tests -v
 ```
 
-当前测试套件共 147 项，测试结果全部通过。
+当前测试套件共 159 项，测试结果全部通过。
 
 只运行不依赖张量计算的核心状态测试：
 
@@ -78,7 +78,7 @@ python3 -m pytest \
 
 | 测试文件 | 主要范围 | 是否启动 CUDA kernel |
 | --- | --- | --- |
-| `test_config.py` | 引擎配置与约束 | 否 |
+| `test_config.py` | 引擎配置、KV Cache dtype 与约束 | 否 |
 | `test_sampling_parameters.py` | 采样参数 | 否 |
 | `test_sequence.py` | 序列状态、分块与传输状态 | 否 |
 | `test_block_manager.py` | 块生命周期与 prefix cache | 否 |
@@ -87,17 +87,17 @@ python3 -m pytest \
 | `test_core_layers.py` | 激活、RMSNorm、RoPE 与 sampler | 否 |
 | `test_linear.py` | 张量并行线性层 | 否，分布式接口使用 mock |
 | `test_embedding_head.py` | 词嵌入与 LM Head | 否，分布式接口使用 mock |
-| `test_attention.py` | Attention prefill/decode 分派 | 否，Triton 函数使用 mock |
+| `test_attention.py` | Attention prefill/decode 分派与 INT8 KV Cache 数值验证 | 部分；CUDA 可用时运行 INT8 Triton kernel |
 | `test_loader.py` | checkpoint 与 packed 权重加载 | 否，文件读取使用 fake |
 | `test_model_factory.py` | 模型构造参数映射 | 否，模型类使用替身 |
-| `test_model_runner.py` | 输入准备、CUDA Graph 缓冲区和 RPC | 否，设备传输与 graph 使用 mock |
+| `test_model_runner.py` | 输入准备、INT8 KV Cache 分配、CUDA Graph 缓冲区和 RPC | 否，设备传输、显存查询与 graph 使用 mock |
 | `test_llm_engine.py` | 引擎编排与输出收集 | 否，外部组件使用 mock |
 
 范围说明：
 
 - `tests/conftest.py` 设置 `TORCHDYNAMO_DISABLE=1`，单元测试关注算子逻辑，不承担 `torch.compile` 性能验证。
 - 测试通过源码包命名空间直接导入子模块，避免导入轻量模块时由顶层 `minivllm.__init__` 提前初始化完整 CUDA 运行栈。
-- Triton attention kernel 的真实数值、显存访问和性能依赖 GPU，仍应使用项目 benchmark 在目标 CUDA 环境验证。
+- `test_attention.py` 会在 CUDA 可用时运行 INT8 KV Cache 写入、decode 和 chunked prefill kernel，并与参考结果比较；更广泛的输入形状和性能仍由项目 benchmark 验证。
 - 每个 `test_*.py` 测试文件都有文件名主体一致的 `test_*.md` 中文文档，包含单独运行命令和覆盖说明。
 
 ## Benchmark 测试结果

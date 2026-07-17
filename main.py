@@ -36,7 +36,10 @@ def main():
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=path)
     llm = LLM(
-        enforce_eager=True, model_name_or_path=model, custom_model_config=model_config
+        enforce_eager=True,
+        model_name_or_path=model,
+        custom_model_config=model_config,
+        # kv_cache_dtype='int8',  # support int8 quantization for k/v cache
     )
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)

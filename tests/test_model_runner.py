@@ -196,6 +196,75 @@ class TestInputPreparation:
         torch.testing.assert_close(temperatures, torch.tensor([0.5, 1.5]))
 
 
+class TestKVCacheAllocation:
+
+    def test_int8_cache_includes_fp32_scale_memory_and_allocates_scale_cache(
+        self, monkeypatch
+    ):
+        real_zeros = torch.zeros
+
+        monkeypatch.setattr(
+            model_runner_module.torch.cuda,
+            "mem_get_info",
+            lambda: (10_000, 10_000),
+        )
+        monkeypatch.setattr(
+            model_runner_module.torch.cuda,
+            "memory_stats",
+            lambda: {
+                "allocated_bytes.all.peak": 0,
+                "allocated_bytes.all.current": 0,
+            },
+        )
+
+        def zeros_on_cpu(*size, **kwargs):
+            kwargs.pop("device", None)
+            return real_zeros(*size, **kwargs)
+
+        monkeypatch.setattr(model_runner_module.torch, "zeros", zeros_on_cpu)
+
+        layers = [
+            SimpleNamespace(
+                k_cache=None,
+                v_cache=None,
+                k_scale_cache=None,
+                v_scale_cache=None,
+            )
+            for _ in range(2)
+        ]
+        runner = make_runner_without_init()
+        runner.config = SimpleNamespace(
+            gpu_memory_utilization=1.0,
+            max_cache_blocks=-1,
+        )
+        runner.rank = 0
+        runner.world_size = 1
+        runner.num_layers = 2
+        runner.block_size = 4
+        runner.num_kv_heads = 2
+        runner.head_dim = 8
+        runner.kv_cache_dtype = torch.int8
+        runner.kv_cache_int8 = True
+        runner.model = SimpleNamespace(modules=lambda: iter(layers))
+
+        runner.allocate_kv_cache()
+
+        # Per block: K/V * layers * tokens * KV heads * (int8 data + FP32 scale).
+        expected_block_bytes = 2 * 2 * 4 * 2 * (8 * 1 + 4)
+        expected_blocks = 10_000 // expected_block_bytes
+        assert runner.config.max_cache_blocks == expected_blocks
+
+        for layer in layers:
+            assert layer.k_cache.shape == (expected_blocks, 4, 2, 8)
+            assert layer.v_cache.shape == (expected_blocks, 4, 2, 8)
+            assert layer.k_cache.dtype == torch.int8
+            assert layer.v_cache.dtype == torch.int8
+            assert layer.k_scale_cache.shape == (expected_blocks, 4, 2)
+            assert layer.v_scale_cache.shape == (expected_blocks, 4, 2)
+            assert layer.k_scale_cache.dtype == torch.float32
+            assert layer.v_scale_cache.dtype == torch.float32
+
+
 class TestModelExecution:
 
     def test_prefill_uses_eager_model_path(self):
