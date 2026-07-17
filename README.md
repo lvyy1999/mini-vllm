@@ -2,12 +2,7 @@
 
 基于 Nano-vLLM 扩展的轻量级 LLM 推理引擎。项目实现了 Triton prefill FlashAttention 和 decode PagedAttention，并包含 Paged KV cache、前缀缓存、chunked prefill、decode CUDA Graph 和张量并行等推理机制。
 
-当前支持以下模型：
-
-- `Qwen/Qwen3-0.6B`
-- `meta-llama/Llama-3.2-1B-Instruct`
-
-更完整的实现说明见[学习文档](docs/learn.md)。
+详见[学习文档](docs/learn.md)。
 
 ## 快速开始
 
@@ -17,11 +12,9 @@
 git clone https://github.com/lvyy1999/mini-vllm
 cd mini-vllm
 
-python3 -m pip install transformers==4.51.1 safetensors huggingface-hub triton tqdm numpy xxhash packaging
+python3 -m pip install transformers triton tqdm numpy xxhash packaging
 python3 main.py
 ```
-
-首次运行会从 Hugging Face 下载 Qwen3-0.6B 的 tokenizer、配置和 safetensors 权重，因此需要能够访问 Hugging Face。离线运行时，可将入口脚本中的 `model` 改为完整的本地模型目录；当前模型工厂按目录名识别模型，因此目录名需要保留为 `Qwen3-0.6B` 或 `Llama-3.2-1B-Instruct`。运行 `benchmark_tps.py --backend vllm` 还需要单独安装 vLLM；下文结果使用的版本是 `vllm==0.8.5`。
 
 `main.py` 演示了使用自定义引擎实现的完整 LLM 推理流程：
 
@@ -31,28 +24,85 @@ python3 main.py
 - 使用 PagedAttention 和 KV cache 管理来提高推理效率
 - 每个 prompt 生成最多 256 个 tokens，采用温度采样
 
+说明：首次运行会从 Hugging Face 下载 Qwen3-0.6B 的 tokenizer、配置和 safetensors 权重，因此需要能够访问 Hugging Face。离线运行时，可将入口脚本中的 `model` 改为完整的本地模型目录；当前模型工厂按目录名识别模型，因此目录名需要保留为 `Qwen3-0.6B`。
+
 ## 项目结构
 
 ```
 mini-vllm/
 ├── src/minivllm/
-│   ├── models/                 # Qwen3 和 Llama 3.2 模型实现
+│   ├── models/                 # 模型工厂和具体模型实现，目前包括 Qwen3 和 Llama 3.2
 │   ├── engine/                 # 调度器、KV cache、执行引擎和 ModelRunner
 │   ├── layers/                 # Triton attention 与模型组件
 │   ├── utils/                  # 配置、运行上下文和权重加载
 │   ├── llm.py                  # 顶层 LLM 接口
 │   └── sampling_parameters.py  # 采样参数
 ├── docs/learn.md               # 实现原理与代码导读
-├── results/                    # Benchmark 原始命令与输出
-├── tests/                      # Scheduler 测试
+├── tests/                      # 单元测试与说明文档
 ├── main.py                     # Qwen3-0.6B 推理演示
-├── main_llama32.py             # Llama-3.2-1B-Instruct 推理演示
+├── main_llama32.py             # Llama-3.2-1B-Instruct 适配示例（未完整实测）
 ├── benchmark_prefilling.py     # Prefill attention 微基准
 ├── benchmark_decoding.py       # Decode attention 微基准
 └── benchmark_tps.py            # 端到端输出 TPS benchmark
 ```
 
+## 单元测试
+
+先按“快速开始”安装与 CUDA 环境匹配的 PyTorch 及项目运行依赖，再安装测试工具：
+
+```bash
+python3 -m pip install pytest
+```
+
+在项目根目录运行完整测试：
+
+```bash
+python3 -m pytest tests -v
+```
+
+当前测试套件共 147 项，测试结果全部通过。
+
+只运行不依赖张量计算的核心状态测试：
+
+```bash
+python3 -m pytest \
+  tests/test_config.py \
+  tests/test_sampling_parameters.py \
+  tests/test_sequence.py \
+  tests/test_block_manager.py \
+  tests/test_scheduler.py \
+  -v
+```
+
+测试分层如下：
+
+| 测试文件 | 主要范围 | 是否启动 CUDA kernel |
+| --- | --- | --- |
+| `test_config.py` | 引擎配置与约束 | 否 |
+| `test_sampling_parameters.py` | 采样参数 | 否 |
+| `test_sequence.py` | 序列状态、分块与传输状态 | 否 |
+| `test_block_manager.py` | 块生命周期与 prefix cache | 否 |
+| `test_scheduler.py` | Prefill、decode、抢占与后处理 | 否 |
+| `test_context.py` | Attention 全局上下文 | 否 |
+| `test_core_layers.py` | 激活、RMSNorm、RoPE 与 sampler | 否 |
+| `test_linear.py` | 张量并行线性层 | 否，分布式接口使用 mock |
+| `test_embedding_head.py` | 词嵌入与 LM Head | 否，分布式接口使用 mock |
+| `test_attention.py` | Attention prefill/decode 分派 | 否，Triton 函数使用 mock |
+| `test_loader.py` | checkpoint 与 packed 权重加载 | 否，文件读取使用 fake |
+| `test_model_factory.py` | 模型构造参数映射 | 否，模型类使用替身 |
+| `test_model_runner.py` | 输入准备、CUDA Graph 缓冲区和 RPC | 否，设备传输与 graph 使用 mock |
+| `test_llm_engine.py` | 引擎编排与输出收集 | 否，外部组件使用 mock |
+
+范围说明：
+
+- `tests/conftest.py` 设置 `TORCHDYNAMO_DISABLE=1`，单元测试关注算子逻辑，不承担 `torch.compile` 性能验证。
+- 测试通过源码包命名空间直接导入子模块，避免导入轻量模块时由顶层 `minivllm.__init__` 提前初始化完整 CUDA 运行栈。
+- Triton attention kernel 的真实数值、显存访问和性能依赖 GPU，仍应使用项目 benchmark 在目标 CUDA 环境验证。
+- 每个 `test_*.py` 测试文件都有文件名主体一致的 `test_*.md` 中文文档，包含单独运行命令和覆盖说明。
+
 ## Benchmark 测试结果
+
+复现端到端对比需要额外安装 vLLM；本节结果基于表中版本，运行 `main.py` 不依赖 vLLM。
 
 测试环境：
 
@@ -60,9 +110,10 @@ mini-vllm/
 |---|---|
 | 平台 | AutoDL，单 GPU |
 | GPU | NVIDIA A100 PCIe 40GB |
-| CPU | 型号未记录，PyTorch 使用 10 个线程 |
+| CPU | Intel Xeon Processor (Skylake, IBRS)，PyTorch 使用 10 个线程 |
 | PyTorch | 2.6.0+cu124 |
 | PyTorch CUDA build | 12.4 |
+| Triton | 3.1.0 |
 | vLLM | 0.8.5 |
 | Transformers | 4.51.1 |
 | 端到端模型 | Qwen/Qwen3-0.6B |
@@ -70,7 +121,7 @@ mini-vllm/
 
 Attention 微基准使用合成输入，配置为 32 个 query heads、8 个 KV heads、`head_dim=128`；decode 测试的 KV cache block size 为 16。CPU PyTorch 使用 FP32 和 10 个 CPU 线程。GPU PyTorch 从 FP16 输入开始，但参考实现会将 Q/K/V 转成 FP32，并包含 Python 循环、临时 tensor 分配以及 prefill 的 causal mask 构造或 decode 的分页 K/V 重建。Triton 路径使用 FP16 输入。计时采用 wall-clock time，并在 GPU 计时边界执行 CUDA synchronize。输入生成和 CPU/GPU 数据传输不计时，但单次函数调用内部的分配、wrapper 和 kernel launch 开销包含在结果中。
 
-因此，GPU PyTorch 数据应理解为用于正确性验证的朴素参考实现，而不是 PyTorch SDPA、FlashAttention 或其他融合 attention kernel。CPU/GPU 和 Triton/GPU PyTorch 加速比只适用于这里定义的实现和输入形状，不能直接代表相对生产级 attention backend 的通用加速比。由于测试时没有记录 CPU 型号，CPU 绝对延迟及其相关加速比也不能用于跨机器复现。
+因此，GPU PyTorch 数据应理解为用于正确性验证的朴素参考实现，而不是 PyTorch SDPA、FlashAttention 或其他融合 attention kernel。CPU/GPU 和 Triton/GPU PyTorch 加速比只适用于这里定义的实现和输入形状，不能直接代表相对生产级 attention backend 的通用加速比。虽然 CPU 型号已记录，但 AutoDL 的虚拟化环境、CPU 频率和资源调度仍可能不同，因此 CPU 绝对延迟及其相关加速比不宜直接用于跨机器对比。
 
 ### Prefill Attention 测试
 
@@ -79,8 +130,6 @@ Attention 微基准使用合成输入，配置为 32 个 query heads、8 个 KV 
 ```bash
 python3 benchmark_prefilling.py
 ```
-
-[完整输出](results/benchmark_prefilling.txt)
 
 | Batch / 序列长度 | 总 token 数 | CPU PyTorch FP32 | GPU PyTorch（FP16 输入，FP32 计算） | GPU Triton（FP16 输入） | Triton 相对 CPU | Triton 相对 GPU PyTorch | Triton vs CPU 最大绝对误差 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -98,8 +147,6 @@ CPU PyTorch FP32 输出作为正确性参考，判定条件为 `torch.allclose(a
 ```bash
 python3 benchmark_decoding.py
 ```
-
-[完整输出](results/benchmark_decoding.txt)
 
 | Batch 大小 | 上下文长度 | CPU PyTorch FP32 | GPU PyTorch（FP16 输入，FP32 计算） | GPU Triton（FP16 输入） | Triton 相对 CPU | Triton 相对 GPU PyTorch | Triton vs CPU 最大绝对误差 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -235,5 +282,3 @@ python3 benchmark_tps.py \
 三种引擎生成的 token 总数完全一致，说明逐请求 `max_tokens` workload 已正确对齐。在该随机长度 workload 下，mini-vLLM 达到 vLLM V1 的 **77.9%**，并达到 vLLM V0 的 **94.8%**；vLLM V0 比 mini-vLLM 高 **5.5%**。随机输入和输出长度会使活跃 batch size 持续变化，可能影响 CUDA Graph batch 对齐、调度和 KV cache 管理，但当前测试不能分离这些因素各自的影响。
 
 固定长度与随机长度测试使用了不同的最大输入/输出长度，不能直接用两张表判断随机化本身带来的性能变化。两组测试均只进行了 1 次 warmup 和 3 次计时，没有报告方差。当前数据适合作为各自 workload 下的初步实测记录；若要形成更稳定的结论，应补充相同最大长度下的固定/随机对照，增加 warmup、repeat 和独立重复运行，并报告离散程度。
-
-[端到端完整命令与输出](results/benchmark_tps.txt)
