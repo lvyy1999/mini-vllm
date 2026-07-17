@@ -234,11 +234,12 @@ def flash_attention_prefill_with_cache_kernel(
         kv_mask = kv_offset < full_seq_len  # (BLOCK_N, )
         logical_block_idx = kv_offset // block_size  # (BLOCK_N, )
         logical_block_offset = kv_offset % block_size  # (BLOCK_N, )
+        safe_logical_block_idx = tl.minimum(logical_block_idx, max_num_blocks - 1)
         physical_block_idx = tl.load(
-            block_tables_ptr + batch_idx * max_num_blocks + logical_block_idx,
-            mask=kv_mask,
-            other=-1,
+            block_tables_ptr + batch_idx * max_num_blocks + safe_logical_block_idx,
         )  # (BLOCK_N, )
+        # avoid to calculate negative addr, use kv_mask when really load k/v cache
+        physical_block_idx = tl.maximum(physical_block_idx, 0)
         kv_cache_offset = (
             physical_block_idx[:, None] * block_size * num_kv_heads * head_dim
             + logical_block_offset[:, None] * num_kv_heads * head_dim
