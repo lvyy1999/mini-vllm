@@ -1,8 +1,76 @@
 # Mini-vLLM
 
-基于 Nano-vLLM 扩展的轻量级 LLM 推理引擎。项目实现了 Triton prefill FlashAttention 和 decode PagedAttention，并包含 Paged KV Cache、前缀缓存、chunked prefill、可选 INT8 KV Cache 量化、decode CUDA Graph 和张量并行等推理机制。
+轻量级大语言模型推理引擎，实现现代 LLM Serving 系统中的核心优化路径。
 
-详见[学习文档](docs/learn.md)。
+项目围绕 LLM 推理优化展开，实现请求调度、Paged KV Cache、Triton Attention Kernel、Decode CUDA Graph Replay、Tensor Parallel 和 INT8 KV Cache 量化等核心模块，并在 Qwen3-0.6B 上完成端到端性能验证。
+
+[核心技术](#核心技术与实现) · [快速开始](#快速开始) · [性能测试](#性能测试) · [Benchmark 详细记录](docs/benchmark.md) · [实现原理与代码导读](docs/learn.md)
+
+## 核心技术与实现
+
+| 模块 | 关键实现                                                        | 优化目标 |
+|---|-------------------------------------------------------------|---|
+| 推理调度 | Continuous Batching、Chunked Prefill、Request Preemption      | 动态组织 Prefill/Decode，提高 GPU 利用率 |
+| KV Cache | Paged KV Cache、Prefix Cache、block 生命周期管理                    | 降低显存碎片，提高缓存复用率 |
+| Attention | Triton FlashAttention、PagedAttention、Online Softmax、GQA/MQA | 降低 Attention 计算和分页 K/V 访问开销 |
+| KV Cache 量化 | Token-wise + KV-head-wise 动态对称 INT8 Quantization            | 降低 KV 存储，提高缓存容量 |
+| 推理执行 | Decode CUDA Graph Replay、多 batch size Graph 复用                    | 降低 Decode Kernel Launch 开销 |
+| 分布式推理 | Tensor Parallel、NCCL 通信（未多卡实测）                              | 提供模型切分和多 GPU 扩展路径 |
+| 模型加载 | 模型工厂、Transformers Tokenizer、safetensors 权重加载                | 统一 Qwen3/Llama 模型构建与权重加载路径 |
+
+## 系统架构
+
+```text
+           用户请求
+              |
+              v
+          Tokenizer
+              |
+              v
+          LLM Engine
+              |
+              v
+          Scheduler
+              |
+   +----------+----------+
+   |                     |
+   v                     v
+Sequence 队列        BlockManager
+(waiting / running)      |
+   |                     |
+   +----------+----------+
+              |
+              v
+         ModelRunner
+              |
+              v
+       Prefill / Decode
+              |
+              v
+        Model Forward
+              |
+              v
+   Triton Attention Kernel
+              |
+              v
+        Paged KV Cache
+              |
+              v
+Unquantized KV Cache / INT8 Quantized KV Cache
+              |
+              v
+        Model Output
+              |
+              v
+      LM Head + Sampler
+              |
+              v
+         Output Token
+```
+
+`Scheduler` 负责请求队列、Continuous Batching、Chunked Prefill 和抢占；
+`BlockManager` 管理物理 block 编号、引用计数、Prefix Cache 和 `Sequence.block_table`，但不直接保存 K/V Tensor;
+`ModelRunner` 负责 batch 输入构造、模型 forward、采样流程以及 Decode 阶段 CUDA Graph 捕获与复用。
 
 ## 快速开始
 
@@ -13,98 +81,48 @@ git clone https://github.com/lvyy1999/mini-vllm
 cd mini-vllm
 
 python3 -m pip install transformers triton tqdm numpy xxhash packaging
+```
+
+运行 Qwen3-0.6B 推理示例：
+
+```bash
 python3 main.py
 ```
 
-`main.py` 演示了使用自定义引擎实现的完整 LLM 推理流程：
+`main.py` 会加载 Qwen3-0.6B，批量处理三个聊天 prompt，并打印 prompt 与 completion。首次运行需要从 Hugging Face 下载 tokenizer、配置和 safetensors 权重；离线运行时，可将脚本中的 `model` 改为完整的本地模型目录，并保留目录名 `Qwen3-0.6B` 供模型工厂识别。
 
-- 基于 Qwen3-0.6B，从 Hugging Face 下载权重并加载
-- 创建多个聊天 prompt
-- 通过自定义 LLM 引擎批处理 prompt
-- 使用 PagedAttention 和 KV Cache 管理来提高推理效率
-- 每个 prompt 生成最多 256 个 tokens，采用温度采样
+### 启用 INT8 KV Cache
 
-KV Cache 默认使用 `auto` 并跟随模型 dtype；构造 `LLM` 时传入 `kv_cache_dtype="int8"` 即可启用 INT8 数据缓存与 FP32 scale 缓存，模型权重和激活 dtype 不变。
+KV Cache 默认使用 `auto` 并跟随模型 dtype。构造 `LLM` 时传入 `kv_cache_dtype="int8"` 即可启用 INT8：
 
-说明：首次运行会从 Hugging Face 下载 Qwen3-0.6B 的 tokenizer、配置和 safetensors 权重，因此需要能够访问 Hugging Face。离线运行时，可将入口脚本中的 `model` 改为完整的本地模型目录；当前模型工厂按目录名识别模型，因此目录名需要保留为 `Qwen3-0.6B`。
-
-## 项目结构
-
-```
-mini-vllm/
-├── src/minivllm/
-│   ├── models/                 # 模型工厂和具体模型实现，目前包括 Qwen3 和 Llama 3.2
-│   ├── engine/                 # 调度器、KV cache、执行引擎和 ModelRunner
-│   ├── layers/                 # Triton attention 与模型组件
-│   ├── utils/                  # 配置、运行上下文和权重加载
-│   ├── llm.py                  # 顶层 LLM 接口
-│   └── sampling_parameters.py  # 采样参数
-├── docs/learn.md               # 实现原理与代码导读
-├── tests/                      # 单元测试与说明文档
-├── main.py                     # Qwen3-0.6B 推理演示
-├── main_llama32.py             # Llama-3.2-1B-Instruct 适配示例（未完整实测）
-├── benchmark_prefilling.py     # Prefill attention 微基准
-├── benchmark_decoding.py       # Decode attention 微基准
-└── benchmark_tps.py            # 端到端输出 TPS benchmark
+```python
+llm = LLM(
+    enforce_eager=True,
+    model_name_or_path=model,
+    custom_model_config=model_config,
+    kv_cache_dtype="int8",
+)
 ```
 
-## 单元测试
+当前量化实现具有以下特征：
 
-先按“快速开始”安装与 CUDA 环境匹配的 PyTorch 及项目运行依赖，再安装测试工具：
+- 对每个 token、每个 KV head 独立计算对称量化 scale。
+- K Cache 和 V Cache 使用 INT8 数据，并分别保存 FP32 scale。
+- Cache 写入时动态量化，Prefill 和 Decode Attention 计算时动态反量化。
+- 仅改变 KV Cache 存储格式，不量化模型权重或激活。
 
-```bash
-python3 -m pip install pytest
-```
+## 性能测试
 
-在项目根目录运行完整测试：
+### 核心测试结果
 
-```bash
-python3 -m pytest tests -v
-```
-
-当前测试套件共 159 项，测试结果全部通过。
-
-只运行不依赖张量计算的核心状态测试：
-
-```bash
-python3 -m pytest \
-  tests/test_config.py \
-  tests/test_sampling_parameters.py \
-  tests/test_sequence.py \
-  tests/test_block_manager.py \
-  tests/test_scheduler.py \
-  -v
-```
-
-测试分层如下：
-
-| 测试文件 | 主要范围 | 是否启动 CUDA kernel |
-| --- | --- | --- |
-| `test_config.py` | 引擎配置、KV Cache dtype 与约束 | 否 |
-| `test_sampling_parameters.py` | 采样参数 | 否 |
-| `test_sequence.py` | 序列状态、分块与传输状态 | 否 |
-| `test_block_manager.py` | 块生命周期与 prefix cache | 否 |
-| `test_scheduler.py` | Prefill、decode、抢占与后处理 | 否 |
-| `test_context.py` | Attention 全局上下文 | 否 |
-| `test_core_layers.py` | 激活、RMSNorm、RoPE 与 sampler | 否 |
-| `test_linear.py` | 张量并行线性层 | 否，分布式接口使用 mock |
-| `test_embedding_head.py` | 词嵌入与 LM Head | 否，分布式接口使用 mock |
-| `test_attention.py` | Attention prefill/decode 分派与 INT8 KV Cache 数值验证 | 部分；CUDA 可用时运行 INT8 Triton kernel |
-| `test_loader.py` | checkpoint 与 packed 权重加载 | 否，文件读取使用 fake |
-| `test_model_factory.py` | 模型构造参数映射 | 否，模型类使用替身 |
-| `test_model_runner.py` | 输入准备、INT8 KV Cache 分配、CUDA Graph 缓冲区和 RPC | 否，设备传输、显存查询与 graph 使用 mock |
-| `test_llm_engine.py` | 引擎编排与输出收集 | 否，外部组件使用 mock |
-
-范围说明：
-
-- `tests/conftest.py` 设置 `TORCHDYNAMO_DISABLE=1`，单元测试关注算子逻辑，不承担 `torch.compile` 性能验证。
-- 测试通过源码包命名空间直接导入子模块，避免导入轻量模块时由顶层 `minivllm.__init__` 提前初始化完整 CUDA 运行栈。
-- `test_attention.py` 会在 CUDA 可用时运行 INT8 KV Cache 写入、decode 和 chunked prefill kernel，并与参考结果比较；更广泛的输入形状和性能仍由项目 benchmark 验证。
-- 每个 `test_*.py` 测试文件都有文件名主体一致的 `test_*.md` 中文文档，包含单独运行命令和覆盖说明。
-
-## Benchmark 测试结果
-
-复现端到端对比需要额外安装 vLLM；本节结果基于表中版本，运行 `main.py` 不依赖 vLLM。
+| 测试 | 核心结果 |
+|---|---|
+| Prefill FlashAttention | 相对朴素 GPU PyTorch 参考实现加速 **7.61x-28.26x** |
+| Decode PagedAttention | 相对朴素 GPU PyTorch 参考实现加速 **5.57x-54.12x** |
+| 端到端输出吞吐 | mini-vLLM 达到 `5250.66 tokens/s`，是 vLLM V0 的 **1.09x**、Transformers 的 **5.40x**，达到 vLLM V1 的 **82.9%** |
+| INT8 KV Cache 吞吐 | 相对 BF16 KV Cache，固定长度提升 **8.7%**，随机长度提升 **0.8%** |
+| INT8 KV Cache 存储 | 单 token KV 存储降低 **48.4%**，相同显存预算下最大缓存容量提高 **94.0%** |
+| INT8 质量冒烟测试 | 8 条问答准确率与 BF16 持平，token 位置一致率为 **96.6%** |
 
 测试环境：
 
@@ -112,175 +130,81 @@ python3 -m pytest \
 |---|---|
 | 平台 | AutoDL，单 GPU |
 | GPU | NVIDIA A100 PCIe 40GB |
-| CPU | Intel Xeon Processor (Skylake, IBRS)，PyTorch 使用 10 个线程 |
-| PyTorch | 2.6.0+cu124 |
-| PyTorch CUDA build | 12.4 |
-| Triton | 3.1.0 |
-| vLLM | 0.8.5 |
-| Transformers | 4.51.1 |
-| 端到端模型 | Qwen/Qwen3-0.6B |
-| 端到端模型 dtype | BF16 |
+| 模型 | Qwen/Qwen3-0.6B，BF16 |
+| 软件 | PyTorch 2.6.0+cu124、Triton 3.1.0 |
 
-Attention 微基准使用合成输入，配置为 32 个 query heads、8 个 KV heads、`head_dim=128`；decode 测试的 KV cache block size 为 16。CPU PyTorch 使用 FP32 和 10 个 CPU 线程。GPU PyTorch 从 FP16 输入开始，但参考实现会将 Q/K/V 转成 FP32，并包含 Python 循环、临时 tensor 分配以及 prefill 的 causal mask 构造或 decode 的分页 K/V 重建。Triton 路径使用 FP16 输入。计时采用 wall-clock time，并在 GPU 计时边界执行 CUDA synchronize。输入生成和 CPU/GPU 数据传输不计时，但单次函数调用内部的分配、wrapper 和 kernel launch 开销包含在结果中。
+### 端到端吞吐
 
-因此，GPU PyTorch 数据应理解为用于正确性验证的朴素参考实现，而不是 PyTorch SDPA、FlashAttention 或其他融合 attention kernel。CPU/GPU 和 Triton/GPU PyTorch 加速比只适用于这里定义的实现和输入形状，不能直接代表相对生产级 attention backend 的通用加速比。虽然 CPU 型号已记录，但 AutoDL 的虚拟化环境、CPU 频率和资源调度仍可能不同，因此 CPU 绝对延迟及其相关加速比不宜直接用于跨机器对比。
+| 推理后端 | 模式 | TPS |
+|---|---|---:|
+| mini-vLLM | Decode CUDA Graph Replay | 5250.66 tokens/s |
+| vLLM | V0 | 4821.59 tokens/s |
+| vLLM | V1 | 6335.95 tokens/s |
+| Transformers | `generate()` | 972.34 tokens/s |
 
-### Prefill Attention 测试
+本次测试中，mini-vLLM 吞吐高于 vLLM V0，低于 vLLM V1。
 
-运行命令：
+### INT8 KV Cache
 
-```bash
-python3 benchmark_prefilling.py
-```
+仅改变 KV Cache 存储格式，模型权重和计算激活保持原始精度。
 
-| Batch / 序列长度 | 总 token 数 | CPU PyTorch FP32 | GPU PyTorch（FP16 输入，FP32 计算） | GPU Triton（FP16 输入） | Triton 相对 CPU | Triton 相对 GPU PyTorch | Triton vs CPU 最大绝对误差 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 x 60 | 120 | 1.046 ms | 0.620 ms | 0.050 ms | 20.79x | 12.31x | 0.001848 |
-| 4 x 64 | 256 | 2.651 ms | 1.236 ms | 0.044 ms | 60.65x | 28.26x | 0.001878 |
-| 2 x 1024 | 2048 | 169.701 ms | 5.760 ms | 0.503 ms | 337.32x | 11.45x | 0.001672 |
-| 1 x 4096 | 4096 | 2677.379 ms | 28.361 ms | 3.729 ms | 718.06x | 7.61x | 0.001583 |
+| 指标 | BF16 KV Cache | INT8 KV Cache | 变化 |
+|---|---:|---:|---:|
+| 固定长度 TPS | 5244.32 | 5701.56 | +8.7% |
+| 随机长度 TPS | 3410.99 | 3439.66 | +0.8% |
+| KV 存储 | 114,688 bytes/token | 59,136 bytes/token | -48.4% |
+| 最大缓存容量 | 308,736 tokens | 599,040 tokens | +94.0% |
+| 8 条简短问答准确率 | 75.0% | 75.0% | 持平 |
 
-CPU PyTorch FP32 输出作为正确性参考，判定条件为 `torch.allclose(atol=0.02, rtol=0.02)`。GPU PyTorch 和 Triton 在全部形状上均通过，所有已报告的最大绝对误差不超过 `0.001953`。在当前朴素 GPU PyTorch 参考实现下，Triton prefill 调用获得 **7.61x-28.26x** 的加速；延迟从短输入的约 `0.05 ms` 增长到 4096-token 输入的 `3.729 ms`，变化趋势与 attention 工作量增长一致。
+> 结果基于特定 workload，用于验证当前实现的优化效果；详细测试口径和限制见 [Benchmark 详细记录](docs/benchmark.md)。
 
-### Decode PagedAttention 测试
-
-运行命令：
-
-```bash
-python3 benchmark_decoding.py
-```
-
-| Batch 大小 | 上下文长度 | CPU PyTorch FP32 | GPU PyTorch（FP16 输入，FP32 计算） | GPU Triton（FP16 输入） | Triton 相对 CPU | Triton 相对 GPU PyTorch | Triton vs CPU 最大绝对误差 |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 60 | 1.193 ms | 0.649 ms | 0.069 ms | 17.18x | 9.34x | 0.001494 |
-| 1 | 512 | 2.743 ms | 0.805 ms | 0.074 ms | 37.22x | 10.91x | 0.000364 |
-| 16 | 256 | 54.722 ms | 2.344 ms | 0.043 ms | 1263.40x | 54.12x | 0.001570 |
-| 4 | 2048 | 145.562 ms | 1.901 ms | 0.342 ms | 426.16x | 5.57x | 0.000228 |
-
-GPU PyTorch 和 Triton 在全部形状上均通过正确性检查，最大绝对误差不超过 `0.001570`。Triton kernel 通过 block table 直接读取分页 KV cache，而 PyTorch 参考实现会重建、padding 并扩展 K/V，因此这里的 **5.57x-54.12x** 加速同时包含了避免这些额外操作的收益。几十微秒级结果也容易受 GPU 频率、launch 开销和计时方法影响，表中的时间应视为完整算子调用的平均延迟，而不是隔离后的 PTX kernel 延迟。
-
-### 端到端输出 TPS 测试
-
-端到端 benchmark 使用随机采样的非特殊 token ID，并分别在独立进程中运行 mini-vLLM、vLLM V0、vLLM V1 和 Transformers。模型加载、tokenizer 加载、workload 构造和 warmup 不计时；prefill、逐 token decode、调度和采样均计入。测试未传入 `--enforce-eager`，因此 mini-vLLM 和 vLLM 均以 `enforce_eager=False` 运行，允许使用 CUDA Graph。默认忽略 EOS，每个 warmup 和计时 repeat 使用不同 prompt，避免重复 prompt 带来的前缀缓存命中。
-
-mini-vLLM 和 vLLM 都会在计时区间内将 completion token IDs 解码为文本：mini-vLLM 的 `generate()` 显式调用 tokenizer，vLLM 未设置 `detokenize`，使用默认值 `True`。Transformers 的 `generate()` 只返回 token tensor，因此 Transformers 结果不包含文本解码开销。mini-vLLM 与 vLLM 的功能口径已经对齐，但如果要进行严格的纯生成吞吐量对比，仍应让所有后端统一关闭 detokenization；如果要比较面向用户的完整生成流程，则应为 Transformers 补上计时区间内的文本解码。
-
-TPS 的统计口径为：
+## 项目结构
 
 ```text
-output TPS = 所有计时 repeat 的实际生成 token 总数 / 总生成耗时
+mini-vllm/
+├── src/minivllm/
+│   ├── models/                 # 模型工厂与 Qwen3、Llama 3.2 实现
+│   ├── engine/                 # 调度器、KV Cache、执行引擎与 ModelRunner
+│   ├── layers/                 # 模型基础层与自定义算子
+│   │   ├── attention.py        # Triton Attention Kernel 与 INT8 KV Cache 量化
+│   │   └── ...                 # Linear、RoPE、RMSNorm、Sampler 等组件
+│   ├── utils/                  # 配置、运行上下文与权重加载
+│   ├── llm.py                  # 顶层 LLM 接口
+│   └── sampling_parameters.py  # 采样参数
+├── benchmarks/
+│   ├── benchmark_prefilling.py # Prefill Attention 微基准
+│   ├── benchmark_decoding.py   # Decode Attention 微基准
+│   ├── benchmark_tps.py        # 端到端输出 TPS Benchmark
+│   └── benchmark_int8.py       # KV Cache 吞吐、显存与质量 Benchmark
+├── docs/
+│   ├── learn.md                # 实现原理与代码导读
+│   └── benchmark.md            # 完整 Benchmark 记录
+├── tests/                      # 单元测试与中文测试文档
+├── main.py                     # Qwen3-0.6B 推理示例
+└── main_llama32.py             # Llama 3.2 适配示例（未完整实测）
 ```
 
-输入 token 会增加耗时，但不计入 TPS 分子。
+## 单元测试
 
-#### 固定长度
-
-每个 repeat 包含 64 条请求，每条请求固定输入 512 tokens，并固定生成 512 tokens。完整命令：
+安装 pytest 并在项目根目录运行：
 
 ```bash
-python3 benchmark_tps.py \
-  --backend minivllm \
-  --max-input-tokens 512 \
-  --num-sequences 64 \
-  --max-output-tokens 512 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16 \
-  --gpu-memory-utilization 0.9
-
-VLLM_USE_V1=0 python3 benchmark_tps.py \
-  --backend vllm \
-  --max-input-tokens 512 \
-  --num-sequences 64 \
-  --max-output-tokens 512 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16 \
-  --gpu-memory-utilization 0.9
-
-VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 benchmark_tps.py \
-  --backend vllm \
-  --max-input-tokens 512 \
-  --num-sequences 64 \
-  --max-output-tokens 512 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16 \
-  --gpu-memory-utilization 0.9
-
-python3 benchmark_tps.py \
-  --backend transformers \
-  --max-input-tokens 512 \
-  --num-sequences 64 \
-  --max-output-tokens 512 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16
+python3 -m pip install pytest
+python3 -m pytest tests -v
 ```
 
-| 推理后端 | 引擎模式 | 总耗时 | 总输出 token 数 | 单次平均耗时 | 单次平均输出 token 数 | TPS |
-|---|---|---:|---:|---:|---:|---:|
-| mini-vLLM | CUDA Graph | 18.7222 s | 98304 | 6.2407 s | 32768.00 | 5250.6584 tokens/s |
-| vLLM | V0 | 20.3883 s | 98304 | 6.7961 s | 32768.00 | 4821.5941 tokens/s |
-| vLLM | V1 | 15.5153 s | 98304 | 5.1718 s | 32768.00 | 6335.9521 tokens/s |
-| Transformers | generate | 101.1002 s | 98304 | 33.7001 s | 32768.00 | 972.3426 tokens/s |
+当前测试套件共 159 项，已在 CUDA 环境中全部通过。测试覆盖配置、采样、Sequence、Block Manager、Scheduler、核心模型层、权重加载、模型工厂、Model Runner、LLM Engine，以及 INT8 KV Cache 的写入、Decode 和 Chunked Prefill。
 
-在该固定长度 workload 下，vLLM V1 吞吐量最高。mini-vLLM 达到 vLLM V1 的 **82.9%**，是 vLLM V0 的 **1.09x**、Transformers 的 **5.40x**；相对 vLLM V0 高 **8.9%**。该结果说明 mini-vLLM 在这一规则的大 batch workload 下接近 vLLM V0，但仍落后于 vLLM V1。由于没有提供 `--enforce-eager` 对照，当前结果不能单独量化 CUDA Graph 的贡献，也不能将差距归因于某一项具体机制。
+每个 `test_*.py` 都有同名的 `test_*.md` 中文文档，记录单独运行命令、覆盖范围和 CUDA 依赖。
 
-#### 随机长度
+## 文档
 
-启用 `--random-length` 后，每条请求的输入长度和 `max_tokens` 分别在 `[128, 1024]` 中独立均匀采样。Transformers backend 当前忽略该选项，因此随机长度结果只比较 mini-vLLM、vLLM V0 和 vLLM V1。完整命令：
+- [实现原理与代码导读](docs/learn.md)：按算子、模型、KV Cache、调度、执行引擎和 Benchmark 组织的学习路线。
+- [Benchmark 详细记录](docs/benchmark.md)：完整环境、命令、结果表、测试口径与限制。
+- [单元测试文档](tests)：各测试模块的中文覆盖说明。
 
-```bash
-python3 benchmark_tps.py \
-  --backend minivllm \
-  --max-input-tokens 1024 \
-  --num-sequences 64 \
-  --max-output-tokens 1024 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16 \
-  --gpu-memory-utilization 0.9 \
-  --random-length
+## 参考项目
 
-VLLM_USE_V1=0 python3 benchmark_tps.py \
-  --backend vllm \
-  --max-input-tokens 1024 \
-  --num-sequences 64 \
-  --max-output-tokens 1024 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16 \
-  --gpu-memory-utilization 0.9 \
-  --random-length
-
-VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 benchmark_tps.py \
-  --backend vllm \
-  --max-input-tokens 1024 \
-  --num-sequences 64 \
-  --max-output-tokens 1024 \
-  --warmup-steps 1 \
-  --repeat 3 \
-  --seed 0 \
-  --model-dtype bfloat16 \
-  --gpu-memory-utilization 0.9 \
-  --random-length
-```
-
-| 推理后端 | 引擎模式 | 总耗时 | 总输出 token 数 | 单次平均耗时 | 单次平均输出 token 数 | TPS |
-|---|---|---:|---:|---:|---:|---:|
-| mini-vLLM | CUDA Graph | 33.9433 s | 112219 | 11.3144 s | 37406.33 | 3306.0748 tokens/s |
-| vLLM | V0 | 32.1858 s | 112219 | 10.7286 s | 37406.33 | 3486.6007 tokens/s |
-| vLLM | V1 | 26.4411 s | 112219 | 8.8137 s | 37406.33 | 4244.1133 tokens/s |
-
-三种引擎生成的 token 总数完全一致，说明逐请求 `max_tokens` workload 已正确对齐。在该随机长度 workload 下，mini-vLLM 达到 vLLM V1 的 **77.9%**，并达到 vLLM V0 的 **94.8%**；vLLM V0 比 mini-vLLM 高 **5.5%**。随机输入和输出长度会使活跃 batch size 持续变化，可能影响 CUDA Graph batch 对齐、调度和 KV cache 管理，但当前测试不能分离这些因素各自的影响。
-
-固定长度与随机长度测试使用了不同的最大输入/输出长度，不能直接用两张表判断随机化本身带来的性能变化。两组测试均只进行了 1 次 warmup 和 3 次计时，没有报告方差。当前数据适合作为各自 workload 下的初步实测记录；若要形成更稳定的结论，应补充相同最大长度下的固定/随机对照，增加 warmup、repeat 和独立重复运行，并报告离散程度。
+- [Nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm)
+- [vLLM](https://github.com/vllm-project/vllm)
+- [Triton](https://github.com/triton-lang/triton)

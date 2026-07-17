@@ -39,7 +39,6 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
     # If not a local path, try to download from HuggingFace
     if checkpoint_path is None or not os.path.exists(checkpoint_path):
         from huggingface_hub import snapshot_download
-
         try:
             checkpoint_path = snapshot_download(
                 repo_id=model_name_or_path,
@@ -99,18 +98,16 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
         if name not in loaded_params:
             unloaded_params.append(name)
 
-    print(f"\n{'=' * 80}")
-    print(f"Weight Loading Summary:")
-    print(f"{'=' * 80}")
-    print(f"Successfully loaded: {len(loaded_params)} parameter groups")
+    print(f"\n{'=' * 20} Weight Loading Summary {'=' * 20}")
+    print(f"Successfully load {len(loaded_params)} model weights from checkpoint.")
 
     if unloaded_params:
         print(
-            f"\n⚠️  WARNING: {len(unloaded_params)} model parameters NOT loaded from checkpoint:"
+            f"\n⚠️  WARNING - {len(unloaded_params)} model weights not loaded from checkpoint:"
         )
         for name in unloaded_params[:15]:
             param = dict(model.named_parameters())[name]
             print(f"  - {name} (shape: {param.shape}, mean: {param.data.mean():.6f})")
         if len(unloaded_params) > 15:
             print(f"  ... and {len(unloaded_params) - 15} more")
-    print(f"{'=' * 80}")
+    print(f"{'=' * 64}")
