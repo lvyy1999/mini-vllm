@@ -21,7 +21,10 @@ class Config:
 
     def __post_init__(self):
         assert 1 <= self.world_size <= 8
-        assert self.cache_block_size % 256 == 0
+        assert (
+                self.cache_block_size > 0
+                and (self.cache_block_size & (self.cache_block_size - 1)) == 0  # must be power of 2
+        )
         if "max_position_embeddings" in self.custom_model_config:
             self.max_model_length = min(
                 self.max_model_length,

@@ -174,6 +174,7 @@ def run_minivllm(
         max_model_length=MAX_INPUT_TOKENS + MAX_OUTPUT_TOKENS,
         model_name_or_path=MODEL_NAME,
         custom_model_config=model_config,
+        cache_block_size=16,
     )
 
     if random_length:
@@ -259,6 +260,7 @@ def run_vllm(
         speculative_config=None,
         dtype=MODEL_DTYPE,
         enforce_eager=ENFORCE_EAGER,
+        block_size=16,
     )
 
     if random_length:

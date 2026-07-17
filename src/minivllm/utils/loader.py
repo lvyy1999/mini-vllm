@@ -5,6 +5,7 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers import AutoConfig
 
+
 # os.environ["HF_HUB_DISABLE_XET"] = "1"
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -90,7 +91,7 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(param, f.get_tensor(weight_name))
+                    weight_loader(param, weight)
 
     # Check for model parameters that weren't loaded
     unloaded_params = []

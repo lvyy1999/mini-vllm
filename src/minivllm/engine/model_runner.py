@@ -371,9 +371,9 @@ class ModelRunner:
     @classmethod
     def prepare_sample(cls, seqs: list[Sequence]) -> Tensor:
         temperatures = [seq.temperature for seq in seqs]
-        return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(
-            non_blocking=True
-        )
+        return torch.tensor(
+            temperatures, dtype=torch.float32, pin_memory=True
+        ).cuda(non_blocking=True)
 
     # when prefilling, directly compute model forward + logits;
     # when decoding, use cuda graph execution to speed up
@@ -436,7 +436,7 @@ class ModelRunner:
     def capture_cudagraph(self) -> None:
         self.graphs = {}
         self.max_graph_bs = min(self.config.max_num_sequences, 512)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, self.max_graph_bs + 1, 16))
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, self.max_graph_bs + 1, 8))
         if self.graph_bs[-1] < self.max_graph_bs:
             self.graph_bs.append(self.max_graph_bs)
 

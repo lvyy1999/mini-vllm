@@ -82,7 +82,7 @@ class BlockManager:
         # how many blocks need to allocate, miss in cache or hit cache but not in use,
         # only those blocks hit in cache and in use needn't allocate
         num_blocks_need_allocate = seq.num_blocks
-        # the last block cannot use cached block, because maybe need to write new token
+        # the final block not use cached block, because maybe need to write new token
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             # find in cache by prefix hash
@@ -115,7 +115,7 @@ class BlockManager:
         cache_missed = False
         num_cached_blocks = 0
         for i in range(seq.num_blocks):
-            if not cache_missed and i != seq.num_blocks - 1:  # the last block cannot use cached block
+            if not cache_missed and i != seq.num_blocks - 1:  # the final block cannot use cached block
                 token_ids = seq.block(i)
                 # find in cache by prefix hash
                 h = self.compute_hash(token_ids, h)
@@ -136,7 +136,7 @@ class BlockManager:
                         self.used_block_ids.add(block_id)
                         self.free_block_ids.remove(block_id)
                     seq.block_table.append(block_id)
-            else:  # cache missed, or be the last block, need to allocate a new block
+            else:  # cache missed, or be the final block, need to allocate a new block
                 seq.block_table.append(self._allocate_block())
         # calculate the number of cached tokens
         seq.num_cached_tokens = num_cached_blocks * self.block_size
