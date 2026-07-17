@@ -434,8 +434,17 @@ def flash_attention_prefill(
     #     (2 * BLOCK_M + 2 * BLOCK_N) * head_dim * sizeof(dtype)
     #     + BLOCK_M * BLOCK_N * sizeof(dtype)
     #     + 2 * BLOCK_M * sizeof(dtype)
-    BLOCK_M = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
-    BLOCK_N = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
+    major, minor = torch.cuda.get_device_capability(q.device)
+    is_sm80 = major == 8 and minor == 0  # A100
+    if major < 8:
+        BLOCK_M = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
+        BLOCK_N = 64 if head_dim <= 64 else 32 if head_dim <= 128 else 16
+    else:
+        if is_sm80:
+            BLOCK_M = 128
+        else:
+            BLOCK_M = 128 if head_dim <= 64 else 64
+        BLOCK_N = 128 if head_dim <= 64 else 64
 
     # calculate grid dimensions
     num_batches = cu_seqlens_q.shape[0] - 1
@@ -644,7 +653,7 @@ def flash_attention_decode(
     max_num_blocks = block_tables.shape[1]
 
     # choose chunk size for processing K/V caches
-    BLOCK_N = 64 if head_dim <= 128 else 32
+    BLOCK_N = 128 if head_dim <= 64 else 64
 
     kv_cache_int8 = k_cache.dtype == torch.int8
     if kv_cache_int8:

@@ -1,6 +1,6 @@
 # Mini-vLLM
 
-基于 Nano-vLLM 扩展的轻量级 LLM 推理引擎。项目实现了 Triton prefill FlashAttention 和 decode PagedAttention，并包含 Paged KV cache、前缀缓存、chunked prefill、decode CUDA Graph 和张量并行等推理机制。
+基于 Nano-vLLM 扩展的轻量级 LLM 推理引擎。项目实现了 Triton prefill FlashAttention 和 decode PagedAttention，并包含 Paged KV Cache、前缀缓存、chunked prefill、可选 INT8 KV Cache 量化、decode CUDA Graph 和张量并行等推理机制。
 
 详见[学习文档](docs/learn.md)。
 
@@ -21,8 +21,10 @@ python3 main.py
 - 基于 Qwen3-0.6B，从 Hugging Face 下载权重并加载
 - 创建多个聊天 prompt
 - 通过自定义 LLM 引擎批处理 prompt
-- 使用 PagedAttention 和 KV cache 管理来提高推理效率
+- 使用 PagedAttention 和 KV Cache 管理来提高推理效率
 - 每个 prompt 生成最多 256 个 tokens，采用温度采样
+
+KV Cache 默认使用 `auto` 并跟随模型 dtype；构造 `LLM` 时传入 `kv_cache_dtype="int8"` 即可启用 INT8 数据缓存与 FP32 scale 缓存，模型权重和激活 dtype 不变。
 
 说明：首次运行会从 Hugging Face 下载 Qwen3-0.6B 的 tokenizer、配置和 safetensors 权重，因此需要能够访问 Hugging Face。离线运行时，可将入口脚本中的 `model` 改为完整的本地模型目录；当前模型工厂按目录名识别模型，因此目录名需要保留为 `Qwen3-0.6B`。
 
