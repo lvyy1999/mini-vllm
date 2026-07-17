@@ -1,49 +1,65 @@
-# Scheduler Tests
+# 调度器单元测试
 
-## Setup
+## 环境准备
 
 ```bash
-pip install pytest xxhash
+python3 -m pip install pytest numpy xxhash
 ```
 
-## Run
+项目本身依赖 PyTorch；应先按项目根目录 `README.md` 完成运行环境安装。
 
-All tests:
+## 运行命令
+
+运行调度器的全部测试：
+
 ```bash
 python3 -m pytest tests/test_scheduler.py -v
 ```
 
-A specific class:
+按测试类运行：
+
 ```bash
 python3 -m pytest tests/test_scheduler.py::TestBug2TokenLimitBreak -v
 python3 -m pytest tests/test_scheduler.py::TestBug1CanAppendFailure -v
 python3 -m pytest tests/test_scheduler.py::TestSchedulerHappyPath -v
+python3 -m pytest tests/test_scheduler.py::TestSchedulerQueueState -v
+python3 -m pytest tests/test_scheduler.py::TestChunkedPrefill -v
+python3 -m pytest tests/test_scheduler.py::TestSchedulerPostprocess -v
 ```
 
-## Test Classes
+## 覆盖范围
 
 ### TestBug2TokenLimitBreak
 
-Guards against sequences being silently dropped when the token budget (or sequence-count limit) is exhausted mid-loop.
+验证 decode 循环在 token 预算或序列数上限耗尽时，不会把尚未调度的序列静默丢失。
 
-Tests:
-- `test_seq_count_is_correct` — only 2 sequences fit in a 2-token budget; `seq_c` must remain in `running`
-- `test_seq_count_limit_variant` — same bug triggered by `max_num_sequences` instead of token budget
-- `test_no_sequence_is_lost` — total sequence conservation: every sequence must be in `running`, `waiting`, or `scheduled`
+- `test_seq_count_is_correct`：2-token 预算只能容纳两个序列，`seq_c` 必须保留在 `running`。
+- `test_seq_count_limit_variant`：覆盖由 `max_num_sequences` 触发的同类边界。
+- `test_no_sequence_is_lost`：所有序列都必须存在于 `running`、`waiting` 或本轮调度结果中。
 
 ### TestBug1CanAppendFailure
 
-Guards against sequences being lost when `block_manager.can_append` returns `False`.
+验证 `block_manager.can_append` 返回 `False` 并触发抢占时，当前序列和队尾序列都不会丢失。
 
-Tests:
-- `test_seq_a_not_lost` — `seq_a` must appear in `running`, `waiting`, or `scheduled` after the call
-- `test_total_conservation` — neither `seq_a` nor `seq_b` may disappear
+- `test_seq_a_not_lost`：调用结束后仍能在调度器状态中找到 `seq_a`。
+- `test_total_conservation`：`seq_a` 与 `seq_b` 均不会消失。
 
 ### TestSchedulerHappyPath
 
-Basic correctness of the scheduler under normal conditions.
+覆盖正常路径，包括 prefill 优先、预算充足时的 decode，以及单序列无法扩展时的自抢占。
 
-Tests:
-- `test_prefill_scheduled_first` — a newly added sequence is scheduled as prefill and moved to `running`
-- `test_all_running_seqs_scheduled_when_budget_allows` — when the token budget is large enough, all running sequences are scheduled and remain in `running`
-- `test_preempt_only_seq_when_cant_append_and_running_empty` — when the only running sequence cannot append, it is preempted to `waiting` with status `WAITING`
+- 新加入的序列先执行 prefill，完成后进入 `running`。
+- 预算充足时，所有运行中序列都会参与本轮 decode。
+- 唯一运行序列无法申请新块时，会回到 `waiting` 并恢复为 prefill 状态。
+
+### TestSchedulerQueueState
+
+覆盖空闲状态判断、加入等待队列，以及抢占后状态重置和队首插入顺序。
+
+### TestChunkedPrefill
+
+验证只有批次中的第一个序列可以执行 chunked prefill，并验证下一轮从已缓存位置继续调度。
+
+### TestSchedulerPostprocess
+
+覆盖 chunked prefill 的计数更新、prefill 完成后的首 token、EOS、`ignore_eos` 和 `max_tokens` 终止条件，以及结束序列的块释放。
