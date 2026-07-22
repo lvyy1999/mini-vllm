@@ -91,6 +91,14 @@ python3 main.py
 
 `main.py` 会加载 Qwen3-0.6B，批量处理三个聊天 prompt，并打印 prompt 与 completion。首次运行需要从 Hugging Face 下载 tokenizer、配置和 safetensors 权重；离线运行时，可将脚本中的 `model` 改为完整的本地模型目录，并保留目录名 `Qwen3-0.6B` 供模型工厂识别。
 
+运行 Llama-3.2-1B-Instruct 推理示例：
+
+```bash
+python3 main_llama32.py
+```
+
+`main_llama32.py` 会从本地目录加载 Llama-3.2-1B-Instruct，批量处理三个聊天 prompt，并打印 prompt 与 completion。首次运行需要从 Hugging Face 下载 tokenizer、配置和 safetensors 权重。
+
 ### 启用 INT8 KV Cache
 
 KV Cache 默认使用 `auto` 并跟随模型 dtype。构造 `LLM` 时传入 `kv_cache_dtype="int8"` 即可启用 INT8：
@@ -181,7 +189,7 @@ mini-vllm/
 │   └── benchmark.md            # 完整 Benchmark 记录
 ├── tests/                      # 单元测试与中文测试文档
 ├── main.py                     # Qwen3-0.6B 推理示例
-└── main_llama32.py             # Llama 3.2 适配示例（未完整实测）
+└── main_llama32.py             # Llama-3.2-1B-Instruct 推理示例
 ```
 
 ## 单元测试

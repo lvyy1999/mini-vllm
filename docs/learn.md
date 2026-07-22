@@ -1,6 +1,6 @@
 <h1 align="center">mini-vLLM 学习路线</h1>
 
-本文档基于仓库当前代码，按“算子 -> 模型 -> KV Cache -> 调度 -> 执行引擎 -> Benchmark”的顺序介绍一个轻量级 LLM 推理引擎。项目面向推理而不是训练，当前以 Qwen3-0.6B 为主要实测模型，并包含尚未完整实测的 Llama-3.2-1B-Instruct 适配；引擎实现了 Paged KV Cache、前缀缓存、chunked prefill、可选 INT8 KV Cache、Triton Attention、Decode CUDA Graph Replay，以及张量并行代码路径。
+本文档基于仓库当前代码，按“算子 -> 模型 -> KV Cache -> 调度 -> 执行引擎 -> Benchmark”的顺序介绍一个轻量级 LLM 推理引擎。项目面向推理而不是训练，当前以 Qwen3-0.6B、Llama-3.2-1B-Instruct 为实测模型，引擎实现了 Paged KV Cache、前缀缓存、chunked prefill、可选 INT8 KV Cache、Triton Attention、Decode CUDA Graph Replay，以及张量并行代码路径。
 
 > 核心代码位于 `src/minivllm`。当前 `ModelRunner` 无论单卡还是多卡都会初始化 NCCL，因此运行环境需要 CUDA、NCCL，以及支持 CUDA 的 PyTorch。张量并行/NCCL 代码路径尚未在真实多 GPU 环境中完整验证，相关章节描述的是当前代码设计。
 
@@ -251,7 +251,7 @@ probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(-1)
 
 实现：[model_factory.py](../src/minivllm/models/model_factory.py)、[qwen3.py](../src/minivllm/models/qwen3.py)、[llama.py](../src/minivllm/models/llama.py)
 
-当前模型工厂包含两个模型入口，其中 Qwen3-0.6B 已作为主要模型实测，Llama-3.2-1B-Instruct 已完成结构适配但尚未完整实测：
+当前模型工厂包含两个模型入口，分别为 Qwen3-0.6B 和 Llama-3.2-1B-Instruct：
 
 | 模型 | 入口 | 主要差异 |
 |---|---|---|
@@ -608,8 +608,6 @@ python3 -m pytest tests -v
 9. 四个 benchmark：分别观察 prefill、decode、端到端吞吐，以及 INT8 KV Cache 的性能、容量和生成质量。
 
 ## 进一步练习
-
-当前 Llama 3.2 已完成结构适配，但仍需要完整实测。更适合基于最新代码继续做的方向包括：
 
 1. 为 prefill/decode benchmark 增加非等长序列和随机 block table，覆盖真正的 varlen/paged 场景。
 2. 优化长序列 prefill 的 `BLOCK_M/BLOCK_N`、`num_warps`、访存和流水线。

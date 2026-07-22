@@ -46,9 +46,8 @@ model_config = {
 
 
 def main():
-    model = "meta-llama/Llama-3.2-1B-Instruct"
-    path = os.path.expanduser("~/huggingface/Llama-3.2-1B-Instruct/")
-    tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=path)
+    model = os.path.expanduser("~/huggingface/Llama-3.2-1B-Instruct/")
+    tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(
         enforce_eager=True, model_name_or_path=model, custom_model_config=model_config
     )
