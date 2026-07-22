@@ -169,5 +169,5 @@ class TestCheckpointLoading:
         load_weights_from_checkpoint(PartiallyLoadedModel(), str(tmp_path))
         output = capsys.readouterr().out
 
-        assert "Successfully loaded: 1 parameter groups" in output
+        assert "Successfully load 1 model weights from checkpoint." in output
         assert "missing" in output

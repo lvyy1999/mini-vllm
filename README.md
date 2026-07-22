@@ -15,7 +15,7 @@
 | Attention | Triton FlashAttention、PagedAttention、Online Softmax、GQA/MQA | 降低 Attention 计算和分页 K/V 访问开销 |
 | KV Cache 量化 | Token-wise + KV-head-wise 动态对称 INT8 Quantization            | 降低 KV 存储，提高缓存容量 |
 | 推理执行 | Decode CUDA Graph Replay、多 batch size Graph 复用                    | 降低 Decode Kernel Launch 开销 |
-| 分布式推理 | Tensor Parallel、NCCL 通信（未多卡实测）                              | 提供模型切分和多 GPU 扩展路径 |
+| 分布式推理 | Tensor Parallel、NCCL 通信（Qwen3 双卡实测）                           | 提供模型切分和多 GPU 扩展路径 |
 | 模型加载 | 模型工厂、Transformers Tokenizer、safetensors 权重加载                | 统一 Qwen3/Llama 模型构建与权重加载路径 |
 
 ## 系统架构
@@ -201,7 +201,7 @@ python3 -m pip install pytest
 python3 -m pytest tests -v
 ```
 
-当前测试套件共 159 项，已在 CUDA 环境中全部通过。测试覆盖配置、采样、Sequence、Block Manager、Scheduler、核心模型层、权重加载、模型工厂、Model Runner、LLM Engine，以及 INT8 KV Cache 的写入、Decode 和 Chunked Prefill。
+当前测试套件共 161 项，已在真实双 GPU CUDA/NCCL 环境中全部通过。测试覆盖配置、采样、Sequence、Block Manager、Scheduler、核心模型层、权重加载、模型工厂、Model Runner、LLM Engine、INT8 KV Cache，以及双卡 TP 分片、NCCL collective 和 Qwen3 Attention 前向。
 
 每个 `test_*.py` 都有同名的 `test_*.md` 中文文档，记录单独运行命令、覆盖范围和 CUDA 依赖。
 

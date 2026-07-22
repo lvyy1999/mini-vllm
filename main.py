@@ -32,13 +32,13 @@ model_config = {
 
 
 def main():
-    model = "Qwen/Qwen3-0.6B"
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=path)
+    model = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    tokenizer = AutoTokenizer.from_pretrained(model)
     llm = LLM(
         enforce_eager=True,
         model_name_or_path=model,
         custom_model_config=model_config,
+        # world_size=2,  # support tensor parallel
         # kv_cache_dtype='int8',  # support int8 quantization for k/v cache
     )
 
